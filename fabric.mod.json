@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "witheraura",
+  "version": "2.0.0",
+  "name": "Wither Utility",
+  "description": "Client-side helper for 1.21.4",
+  "authors": ["User"],
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.example.witheraura.WitherAuraClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
