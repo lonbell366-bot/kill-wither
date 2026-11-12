@@ -5,10 +5,14 @@ import com.google.gson.GsonBuilder;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.message.v1.ClientReceiveMessageEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.DrawContext;
 import net.minecraft.client.network.ClientPlayerEntity;
 import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.ItemEnchantmentsComponent;
@@ -35,6 +39,8 @@ import org.lwjgl.glfw.GLFW;
 import java.io.*;
 import java.util.Comparator;
 import java.util.Random;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.StreamSupport;
 
 public class WitherAuraClient implements ClientModInitializer {
@@ -42,22 +48,69 @@ public class WitherAuraClient implements ClientModInitializer {
     private static KeyBinding keyZ, keyX;
     private final Random rng = new Random();
 
-    private boolean enabled = false, zWasDown = false, xWasDown = false, wasAlive = false;
-    private boolean holdingSprint = false, holdingSneak = false;
+    private boolean enabled = false, zWasDown = false, xWasDown = false, holdingSprint = false;
     private LivingEntity target = null;
     private Vec3d aimOffset = Vec3d.ZERO;
 
-    private long acquireTime, reactDelay, rotPauseUntil, nextShift, nextAtk, postKillUntil, breakUntil;
-    private long switchTime, lockAtkUntil, sprintResume, sneakResume, nextF12Time = 0, nextFatigueShift = 0;
-    private int pendingSlot = -1, kills = 0, killsGoal = 14, attackStreak = 0;
-    private double curRange = 2.92, fatigueMultiplier = 1.0, swayPhase = 0.0;
+    private long sessionStartTime = 0, acquireTime, reactDelay, nextShift, nextAtk, switchTime, lockAtkUntil, sprintResume, nextF12Time = 0;
+    private int pendingSlot = -1;
+    private double curRange = 2.95, swayPhase = 0.0, totalMoney = 0.0;
+
+    // Bắt số tiền từ thông báo chat/Auto Sell (Ví dụ: "$ 300K", "+$1.5M", "$50,000")
+    private static final Pattern MONEY_PATTERN = Pattern.compile("\\$\\s*([0-9]+(?:[.,][0-9]+)?)\\s*([kKmMbB]?)");
 
     @Override
     public void onInitializeClient() {
         cfg = ModConfig.load();
+        sessionStartTime = System.currentTimeMillis();
+
         keyZ = KeyBindingHelper.registerKeyBinding(new KeyBinding("Bật/Tắt WitherAura (Z)", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_Z, "Wither Utility"));
         keyX = KeyBindingHelper.registerKeyBinding(new KeyBinding("Đổi Chế Độ Mục Tiêu (X)", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_X, "Wither Utility"));
+
         ClientTickEvents.START_CLIENT_TICK.register(this::tick);
+        HudRenderCallback.EVENT.register(this::renderHud);
+
+        // Lắng nghe tin nhắn game để cộng tiền bán được
+        ClientReceiveMessageEvents.GAME.register((message, overlay) -> parseMoneyChat(message.getString()));
+        ClientReceiveMessageEvents.CHAT.register((message, signed, sender, params, timestamp) -> parseMoneyChat(message.getString()));
+    }
+
+    private void parseMoneyChat(String rawText) {
+        if (rawText == null || rawText.contains("[WitherAura]")) return;
+        String clean = Formatting.strip(rawText);
+        if (clean == null) return;
+
+        Matcher m = MONEY_PATTERN.matcher(clean);
+        if (m.find()) {
+            try {
+                double val = Double.parseDouble(m.group(1).replace(",", ""));
+                String unit = m.group(2).toUpperCase();
+                if ("K".equals(unit)) val *= 1_000.0;
+                else if ("M".equals(unit)) val *= 1_000_000.0;
+                else if ("B".equals(unit)) val *= 1_000_000_000.0;
+                if (val > 0) totalMoney += val;
+            } catch (Exception ignored) {}
+        }
+    }
+
+    // 1. VẼ BẢNG HUD Ở GÓC TRÊN CÙNG BÊN TRÁI
+    private void renderHud(DrawContext ctx, RenderTickCounter tickCounter) {
+        MinecraftClient mc = MinecraftClient.getInstance();
+        if (mc.player == null || mc.options.hudHidden || !cfg.showHud) return;
+
+        long elapsedMs = Math.max(1000L, System.currentTimeMillis() - sessionStartTime);
+        double hours = elapsedMs / 3600000.0;
+        double perHour = totalMoney / hours;
+
+        String line1 = "Thời gian: " + formatDuration(elapsedMs);
+        String line2 = "Farm/giờ: $" + formatMoney(perHour) + "/h (Tổng: $" + formatMoney(totalMoney) + ")";
+        String line3 = "KillAura: " + (enabled ? "BẬT" : "TẮT") + (cfg.onlyWither ? " [Wither]" : " [Mọi Quái]");
+
+        int w = Math.max(mc.textRenderer.getWidth(line2), Math.max(mc.textRenderer.getWidth(line1), mc.textRenderer.getWidth(line3))) + 10;
+        ctx.fill(4, 4, 4 + w, 40, 0x88000000);
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(line1), 8, 7, 0xFFFFFF);
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(line2), 8, 18, 0x55FF55);
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(line3), 8, 29, enabled ? 0xFFFF55 : 0xFF5555);
     }
 
     private void tick(MinecraftClient mc) {
@@ -65,10 +118,9 @@ public class WitherAuraClient implements ClientModInitializer {
         ClientPlayerEntity p = mc.player;
         long win = mc.getWindow().getHandle(), now = System.currentTimeMillis();
 
-        // Tự động bấm F12 ngẫu nhiên từ 5p00s đến 5p20s kèm nhiễu mili-giây
-        if (nextF12Time == 0) {
-            scheduleNextF12(now);
-        } else if (now >= nextF12Time) {
+        // Random nhấn F12 từ 5p00s đến 5p20s
+        if (nextF12Time == 0) scheduleNextF12(now);
+        else if (now >= nextF12Time) {
             if (mc.currentScreen == null) {
                 mc.keyboard.onKey(win, GLFW.GLFW_KEY_F12, 0, GLFW.GLFW_PRESS, 0);
                 mc.keyboard.onKey(win, GLFW.GLFW_KEY_F12, 0, GLFW.GLFW_RELEASE, 0);
@@ -87,8 +139,7 @@ public class WitherAuraClient implements ClientModInitializer {
         if (toggleTrig) {
             enabled = !enabled;
             target = null;
-            releaseTempKeys(mc, p);
-            msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Anti-Bot v5)" : "[WitherAura] ĐÃ TẮT", enabled ? Formatting.GREEN : Formatting.RED);
+            msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Phím Z)" : "[WitherAura] ĐÃ TẮT (Phím Z)", enabled ? Formatting.GREEN : Formatting.RED);
         }
         if (modeTrig) {
             boolean prev = cfg.onlyWither;
@@ -101,53 +152,31 @@ public class WitherAuraClient implements ClientModInitializer {
 
         if (!enabled) return;
 
-        // Khôi phục phím chạy và phím ngồi giả lập
         if (holdingSprint && now >= sprintResume) {
             holdingSprint = false;
             if (mc.options.forwardKey.isPressed()) p.setSprinting(true);
-        }
-        if (holdingSneak && now >= sneakResume) {
-            holdingSneak = false;
-            mc.options.sneakKey.setPressed( false );
         }
 
         if (p.getHealth() <= cfg.minHealth || (cfg.panicPlayer && hasNearPlayer(mc, p))) {
             enabled = false;
             target = null;
-            releaseTempKeys(mc, p);
             msg(p, "[WitherAura] Tự ngắt an toàn!", Formatting.RED);
             return;
         }
         if (mc.currentScreen != null) return;
 
-        // Cập nhật chu kỳ mỏi tay (Fatigue Wave) mỗi 25 - 75 giây để không bao giờ giữ nhịp CPS cố định
-        if (now >= nextFatigueShift) {
-            fatigueMultiplier = 0.82 + rng.nextDouble() * 0.55; // Dao động từ 82% đến 137% tốc độ gốc
-            nextFatigueShift = now + gauss(25000, 75000);
-        }
-
-        // Nhịp thở chuột liên tục (Chống cờ đỏ Yaw/Pitch cố định tuyệt đối)
-        applyHumanBreathingSway(mc, p);
-
-        if (now < breakUntil || now < postKillUntil) {
-            // Thỉnh thoảng nhấp Shift nhẹ hoặc lia mắt khi đang nghỉ giữa các đợt quái
-            if (rng.nextDouble() < 0.012 && !holdingSneak) {
-                holdingSneak = true;
-                mc.options.sneakKey.setPressed(true);
-                sneakResume = now + gauss(140, 420);
-            }
+        // 2. NHƯỜNG QUYỀN CHO AUTO EAT: Nếu đang cầm đồ ăn khi đói hoặc đang nhai đồ ăn -> Dừng chém & không giành ô hotbar
+        if (isEatingOrHoldingFood(mc, p)) {
+            pendingSlot = -1;
             return;
         }
 
-        if (target != null && wasAlive && !target.isAlive()) {
-            wasAlive = false;
-            target = null;
-            postKillUntil = now + gauss(cfg.minPostKillMs, cfg.maxPostKillMs);
-            if (++kills >= killsGoal) {
-                kills = 0;
-                killsGoal = gauss(9, 22);
-                breakUntil = now + gauss(cfg.minBreakMs, cfg.maxBreakMs);
-            }
+        // Nhịp thở chuột siêu nhẹ chống đứng im tọa độ Yaw/Pitch
+        applyHumanBreathingSway(mc, p);
+
+        // Ngay sau khi ăn xong -> Tự động chuyển lại về ô cầm kiếm tốt nhất rồi mới chém tiếp
+        if (cfg.autoSword && !isHoldingSword(p)) {
+            autoSwitchSword(p, now);
             return;
         }
 
@@ -155,9 +184,8 @@ public class WitherAuraClient implements ClientModInitializer {
         if (best == null) { target = null; return; }
         if (best != target) {
             target = best;
-            wasAlive = target.isAlive();
             acquireTime = now;
-            reactDelay = (long) (gauss(cfg.minReactMs, cfg.maxReactMs) * fatigueMultiplier);
+            reactDelay = gauss(cfg.minReactMs, cfg.maxReactMs);
             curRange = cfg.minRange + rng.nextDouble() * (cfg.maxRange - cfg.minRange);
             shiftAim(now);
         }
@@ -169,113 +197,81 @@ public class WitherAuraClient implements ClientModInitializer {
         if (cfg.autoSword) autoSwitchSword(p, now);
         if (isBroken(p.getMainHandStack())) return;
 
-        // Xoay tâm siêu nhẹ và chỉ xoay khi tia nhìn sắp lệch khỏi vùng an toàn của Hitbox
-        if (now >= rotPauseUntil) {
-            if (rng.nextDouble() < 0.07) rotPauseUntil = now + gauss(35, 110);
-            else rotateMinimalHuman(mc, p, target, visPt.add(aimOffset));
-        }
+        rotateMinimalHuman(mc, p, target, visPt.add(aimOffset));
 
+        // 3. TỐC ĐỘ CHÉM CHUẨN: Đánh ngay khi thanh hồi chiêu đầy 100% + độ lệch cực ngắn (15ms - 65ms)
         if (now - acquireTime < reactDelay || now < lockAtkUntil || now < nextAtk) return;
+        if (p.getAttackCooldownProgress(0.5f) < 1.0f) return;
 
-        // Ngưỡng chờ hồi chiêu biến thiên tự nhiên (không luôn cứng nhắc ở 100.0%)
-        float cdReq = rng.nextDouble() < 0.62 ? 1.0f : (0.92f + rng.nextFloat() * 0.08f);
-        if (p.getAttackCooldownProgress(0.5f) < cdReq) return;
-
-        // Kiểm tra tia nhìn cắt qua Hitbox thật trước khi đánh (Hợp lệ 100% với GrimAC)
         Vec3d eye = p.getEyePos();
         Vec3d lookEnd = eye.add(p.getRotationVec(1.0f).multiply(curRange + 0.25));
-        if (target.getBoundingBox().expand(0.10).raycast(eye, lookEnd).isEmpty()) return;
-
-        // Mô phỏng người thật thỉnh thoảng bấm nhầm/vung kiếm hụt hoặc khựng tay vài giây
-        if (rng.nextDouble() < cfg.missChance) {
-            p.swingHand(Hand.MAIN_HAND);
-            nextAtk = now + gauss(280, 850);
-            return;
-        }
+        if (target.getBoundingBox().expand(0.12).raycast(eye, lookEnd).isEmpty()) return;
 
         mc.interactionManager.attackEntity(p, target);
         p.swingHand(Hand.MAIN_HAND);
-        attackStreak++;
 
-        if (cfg.sprintReset && p.isSprinting() && rng.nextDouble() < 0.58) {
+        if (cfg.sprintReset && p.isSprinting() && rng.nextDouble() < 0.60) {
             p.setSprinting(false);
             holdingSprint = true;
-            sprintResume = now + gauss(50, 155);
+            sprintResume = now + gauss(45, 115);
         }
 
-        // Tính toán độ trễ đòn tiếp theo bằng Phân phối Hỗn hợp (Bimodal Gaussian + Gián đoạn tự nhiên)
-        nextAtk = now + computeAntiMacroDelay();
+        // Độ trễ ngẫu nhiên nhỏ sau khi hồi đầy thanh chém (trung bình ~35ms, không bao giờ khựng 2 giây)
+        nextAtk = now + gauss(cfg.minAttackJitterMs, cfg.maxAttackJitterMs);
     }
 
     /**
-     * Thuật toán sinh độ trễ đa tầng chống phát hiện Macro / Auto-Clicker:
-     * Kết hợp phân phối chuẩn lệch + chu kỳ mỏi tay + gián đoạn bất quy tắc
+     * Kiểm tra nhân vật đang cầm đồ ăn để ăn hoặc đang trong quá trình ăn của Auto Eat
      */
-    private long computeAntiMacroDelay() {
-        double base = cfg.meanDelayMs * fatigueMultiplier;
-        double spread = cfg.stdDelayMs * (0.85 + rng.nextDouble() * 0.45);
-        long delay = Math.round(base + rng.nextGaussian() * spread);
+    private boolean isEatingOrHoldingFood(MinecraftClient mc, ClientPlayerEntity p) {
+        ItemStack main = p.getMainHandStack();
+        ItemStack off = p.getOffHandStack();
+        boolean mainIsFood = main.contains(DataComponentTypes.FOOD);
+        boolean offIsFood = off.contains(DataComponentTypes.FOOD);
 
-        // 15% cơ hội rơi vào nhịp bấm chậm hơn bình thường (mô phỏng phân phối 2 đỉnh của tay người)
-        if (rng.nextDouble() < 0.15) {
-            delay += gauss(110, 340);
-        }
+        // Đang bấm chuột phải ăn đồ ăn ở tay chính hoặc tay phụ
+        if (p.isUsingItem() && (mainIsFood || offIsFood)) return true;
+        if (mc.options.useKey.isPressed() && (mainIsFood || offIsFood)) return true;
 
-        // 5% cơ hội hoặc sau mỗi chuỗi đánh dài sẽ có nhịp khựng lớn (0.7s - 2.4s)
-        if (rng.nextDouble() < 0.05 || attackStreak > gauss(18, 35)) {
-            delay += gauss(700, 2400);
-            attackStreak = 0;
-        }
+        // Auto Eat vừa chuyển tay chính sang đồ ăn vì thanh thức ăn chưa đầy
+        return mainIsFood && p.getHungerManager().isNotFull();
+    }
 
-        return Math.max(28, delay + rng.nextInt(17));
+    private boolean isHoldingSword(ClientPlayerEntity p) {
+        ItemStack s = p.getMainHandStack();
+        return s.getItem() instanceof SwordItem || s.isIn(ItemTags.SWORDS);
     }
 
     private void scheduleNextF12(long now) {
-        // Ngẫu nhiên từ 5 phút (300,000ms) đến 5 phút 20 giây (320,000ms) bằng phân phối Gaussian + Jitter
-        long baseMs = gauss(300000, 320000);
-        long subMsJitter = rng.nextInt(997) - 498;
-        nextF12Time = now + Math.clamp(baseMs + subMsJitter, 300000L, 320000L);
+        nextF12Time = now + gauss(300000, 320000);
     }
 
-    /**
-     * Chỉ xoay màn hình một góc cực nhỏ khi thật sự cần thiết.
-     * Nếu tâm ngắm đã nằm sẵn trong khung người quái thì giữ nguyên màn hình, chỉ thêm độ rung tay tự nhiên.
-     */
     private void rotateMinimalHuman(MinecraftClient mc, ClientPlayerEntity p, LivingEntity e, Vec3d pt) {
         Vec3d eye = p.getEyePos();
         Vec3d lookEnd = eye.add(p.getRotationVec(1.0f).multiply(curRange + 0.2));
-        // Nếu tâm hiện tại đã chĩa trúng bên trong vùng lõi Hitbox -> Không kéo màn hình của người chơi
-        if (e.getBoundingBox().contract(0.08).raycast(eye, lookEnd).isPresent()) {
-            return;
-        }
+        if (e.getBoundingBox().contract(0.06).raycast(eye, lookEnd).isPresent()) return;
 
         float[] ang = angleTo(p, pt);
         float yStep = cfg.minYaw + rng.nextFloat() * (cfg.maxYaw - cfg.minYaw);
         float pStep = cfg.minPitch + rng.nextFloat() * (cfg.maxPitch - cfg.minPitch);
-        float dYaw = MathHelper.clamp(ang[2] * (0.35f + rng.nextFloat() * 0.25f), -yStep, yStep) + (float) (rng.nextGaussian() * 0.18f);
-        float dPitch = MathHelper.clamp(ang[3] * (0.30f + rng.nextFloat() * 0.22f), -pStep, pStep) + (float) (rng.nextGaussian() * 0.14f);
-
+        float dYaw = MathHelper.clamp(ang[2] * (0.45f + rng.nextFloat() * 0.25f), -yStep, yStep) + (float) (rng.nextGaussian() * 0.15f);
+        float dPitch = MathHelper.clamp(ang[3] * (0.40f + rng.nextFloat() * 0.22f), -pStep, pStep) + (float) (rng.nextGaussian() * 0.12f);
         applyGcdRotation(mc, p, dYaw, dPitch);
     }
 
-    /**
-     * Tạo dao động tay cầm chuột siêu nhỏ liên tục để tọa độ Yaw/Pitch không bao giờ đứng yên tuyệt đối
-     */
     private void applyHumanBreathingSway(MinecraftClient mc, ClientPlayerEntity p) {
         swayPhase += 0.09 + rng.nextDouble() * 0.07;
-        if (rng.nextDouble() < 0.42) {
-            float swayYaw = (float) (Math.sin(swayPhase) * 0.08 + rng.nextGaussian() * 0.11);
-            float swayPitch = (float) (Math.cos(swayPhase * 0.8) * 0.06 + rng.nextGaussian() * 0.08);
+        if (rng.nextDouble() < 0.40) {
+            float swayYaw = (float) (Math.sin(swayPhase) * 0.07 + rng.nextGaussian() * 0.09);
+            float swayPitch = (float) (Math.cos(swayPhase * 0.8) * 0.05 + rng.nextGaussian() * 0.07);
             applyGcdRotation(mc, p, swayYaw, swayPitch);
         }
     }
 
     private void applyGcdRotation(MinecraftClient mc, ClientPlayerEntity p, float dYaw, float dPitch) {
         float gcd = getGcd(mc);
-        float fixedYaw = dYaw - (dYaw % gcd);
-        float fixedPitch = dPitch - (dPitch % gcd);
-        p.setYaw(p.getYaw() + fixedYaw);
-        p.setPitch(MathHelper.clamp(p.getPitch() + fixedPitch, -89.9f, 89.9f));
+        p.setYaw(p.getYaw() + dYaw - (dYaw % gcd));
+        p.setPitch(MathHelper.clamp(p.getPitch() + dPitch - (dPitch % gcd), -89.9f, 89.9f));
     }
 
     private LivingEntity findTarget(MinecraftClient mc, ClientPlayerEntity p) {
@@ -330,11 +326,11 @@ public class WitherAuraClient implements ClientModInitializer {
             }
         }
         if (best == -1 || p.getInventory().selectedSlot == best) { pendingSlot = -1; return; }
-        if (pendingSlot != best) { pendingSlot = best; switchTime = now + gauss(95, 245); return; }
+        if (pendingSlot != best) { pendingSlot = best; switchTime = now + gauss(50, 120); return; }
         if (now >= switchTime) {
             p.getInventory().selectedSlot = pendingSlot;
             pendingSlot = -1;
-            lockAtkUntil = now + gauss(95, 240);
+            lockAtkUntil = now + gauss(50, 120);
         }
     }
 
@@ -352,15 +348,7 @@ public class WitherAuraClient implements ClientModInitializer {
     private void shiftAim(long now) {
         double r = cfg.aimOffset;
         aimOffset = new Vec3d(rng.nextGaussian() * r * 0.45, rng.nextGaussian() * r * 0.35, rng.nextGaussian() * r * 0.45);
-        nextShift = now + gauss(130, 440);
-    }
-
-    private void releaseTempKeys(MinecraftClient mc, ClientPlayerEntity p) {
-        holdingSprint = false;
-        if (holdingSneak) {
-            holdingSneak = false;
-            mc.options.sneakKey.setPressed(false);
-        }
+        nextShift = now + gauss(140, 420);
     }
 
     private float getGcd(MinecraftClient mc) {
@@ -372,6 +360,18 @@ public class WitherAuraClient implements ClientModInitializer {
         return min >= max ? min : MathHelper.clamp((int) Math.round((min + max) / 2.0 + rng.nextGaussian() * ((max - min) / 3.8)), min, max);
     }
 
+    private String formatDuration(long ms) {
+        long s = ms / 1000;
+        return String.format("%02d:%02d:%02d", s / 3600, (s % 3600) / 60, s % 60);
+    }
+
+    private String formatMoney(double val) {
+        if (val >= 1_000_000_000) return String.format("%.2fB", val / 1_000_000_000.0);
+        if (val >= 1_000_000) return String.format("%.2fM", val / 1_000_000.0);
+        if (val >= 1_000) return String.format("%.1fK", val / 1_000.0);
+        return String.format("%.0f", val);
+    }
+
     private void msg(ClientPlayerEntity p, String text, Formatting color) {
         if (!cfg.silentMode) {
             p.sendMessage(Text.literal(text).formatted(color), true);
@@ -381,12 +381,12 @@ public class WitherAuraClient implements ClientModInitializer {
 
     public static class ModConfig {
         private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-        private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "wither_aura.json");
-        public boolean onlyWither = true, autoSword = true, sprintReset = true, panicPlayer = false, silentMode = false;
+        private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "wither_aura_v6.json");
+        public boolean onlyWither = true, autoSword = true, sprintReset = true, panicPlayer = false, silentMode = false, showHud = true;
         public String priority = "DISTANCE";
-        public double minRange = 2.82, maxRange = 2.98, aimOffset = 0.16, missChance = 0.04, panicRadius = 15.0;
-        public float fov = 150.0f, minYaw = 11.0f, maxYaw = 26.0f, minPitch = 8.0f, maxPitch = 19.0f, minHealth = 6.0f;
-        public int meanDelayMs = 95, stdDelayMs = 52, minReactMs = 120, maxReactMs = 290, minPostKillMs = 110, maxPostKillMs = 310, minBreakMs = 1800, maxBreakMs = 4800, minDurability = 12;
+        public double minRange = 2.85, maxRange = 3.00, aimOffset = 0.15, panicRadius = 15.0;
+        public float fov = 160.0f, minYaw = 14.0f, maxYaw = 30.0f, minPitch = 10.0f, maxPitch = 22.0f, minHealth = 6.0f;
+        public int minAttackJitterMs = 15, maxAttackJitterMs = 65, minReactMs = 30, maxReactMs = 85, minDurability = 12;
 
         public static ModConfig load() {
             if (FILE.exists()) try (FileReader r = new FileReader(FILE)) { return GSON.fromJson(r, ModConfig.class); } catch (Exception ignored) {}
@@ -394,5 +394,5 @@ public class WitherAuraClient implements ClientModInitializer {
         }
         public void save() { try (FileWriter w = new FileWriter(FILE)) { GSON.toJson(this, w); } catch (Exception ignored) {} }
     }
-            }
-    
+    }
+                                
