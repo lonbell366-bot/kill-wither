@@ -1,14 +1,44 @@
 plugins {
     id 'fabric-loom' version '1.9-SNAPSHOT'
-    id 'maven-publish'
 }
 
-version = '2.0.0'
+version = '4.0.0'
 group = 'com.example'
 
 base {
     archivesName = 'wither-aura-1.21.4'
 }
+
+def modDir = file('src/main/java/com/example/witheraura')
+def resDir = file('src/main/resources')
+modDir.mkdirs()
+resDir.mkdirs()
+
+fileTree('.').matching {
+    include '**/*.java'
+    exclude 'src/**'
+    exclude 'build/**'
+    exclude '.gradle/**'
+}.each { f ->
+    file("${modDir}/WitherAuraClient.java").text = f.text
+}
+
+file("${resDir}/fabric.mod.json").text = '''{
+  "schemaVersion": 1,
+  "id": "witheraura",
+  "version": "4.0.0",
+  "name": "Wither Utility",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.example.witheraura.WitherAuraClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "~1.21.4",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}'''
 
 repositories {
     mavenCentral()
@@ -18,7 +48,7 @@ dependencies {
     minecraft 'com.mojang:minecraft:1.21.4'
     mappings 'net.fabricmc:yarn:1.21.4+build.8:v2'
     modImplementation 'net.fabricmc:fabric-loader:0.16.10'
-    modImplementation 'net.fabricmc.fabric-api:fabric-api:0.114.0+1.21.4'
+    modImplementation 'net.fabricmc:fabric-api:fabric-api:0.114.0+1.21.4'
 }
 
 java {
