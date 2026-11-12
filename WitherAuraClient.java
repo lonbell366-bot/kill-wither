@@ -20,7 +20,6 @@ import net.minecraft.entity.mob.WitherSkeletonEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.SwordItem;
-import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
 import net.minecraft.registry.tag.ItemTags;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
@@ -42,16 +41,16 @@ public class WitherAuraClient implements ClientModInitializer {
     private static ModConfig cfg;
     private static KeyBinding keyZ, keyX;
     private final Random rng = new Random();
-    private boolean enabled = false, zWasDown = false, xWasDown = false, wasAlive = false, holdingSprint = false;
+
+    private boolean enabled = false, zWasDown = false, xWasDown = false, wasAlive = false;
+    private boolean holdingSprint = false, holdingSneak = false;
     private LivingEntity target = null;
     private Vec3d aimOffset = Vec3d.ZERO;
-    private long acquireTime, reactDelay, rotPauseUntil, nextShift, nextAtk, postKillUntil, breakUntil, switchTime, lockAtkUntil, sprintResume;
-    private long nextF12Time = 0; // Bộ đếm thời gian bấm phím F12 ngẫu nhiên từ 5p - 5p20s
-    private int pendingSlot = -1, kills = 0, killsGoal = 16;
-    private double curRange = 2.95;
 
-    // Biến lưu góc nhìn ảo (Silent Rotation) để màn hình game của bạn không bị giật/di chuyển
-    private float clientYaw = 0f, clientPitch = 0f;
+    private long acquireTime, reactDelay, rotPauseUntil, nextShift, nextAtk, postKillUntil, breakUntil;
+    private long switchTime, lockAtkUntil, sprintResume, sneakResume, nextF12Time = 0, nextFatigueShift = 0;
+    private int pendingSlot = -1, kills = 0, killsGoal = 14, attackStreak = 0;
+    private double curRange = 2.92, fatigueMultiplier = 1.0, swayPhase = 0.0;
 
     @Override
     public void onInitializeClient() {
@@ -66,23 +65,13 @@ public class WitherAuraClient implements ClientModInitializer {
         ClientPlayerEntity p = mc.player;
         long win = mc.getWindow().getHandle(), now = System.currentTimeMillis();
 
-        // Khởi tạo góc nhìn ảo ban đầu khớp với nhân vật
-        if (clientYaw == 0f && clientPitch == 0f) {
-            clientYaw = p.getYaw();
-            clientPitch = p.getPitch();
-        }
-
-        // --- TÍNH NĂNG TỰ ĐỘNG BẤM PHÍM F12 NGẪU NHYÊN TỪ 5 PHÚT ĐẾN 5 PHÚT 20 GIÂY ---
+        // Tự động bấm F12 ngẫu nhiên từ 5p00s đến 5p20s kèm nhiễu mili-giây
         if (nextF12Time == 0) {
             scheduleNextF12(now);
         } else if (now >= nextF12Time) {
-            // Giả lập sự kiện nhấn phím F12 tự động trong game
-            long windowHandle = mc.getWindow().getHandle();
-            // Gửi tín hiệu phím F12 (GLFW_KEY_F12)
             if (mc.currentScreen == null) {
-                // Thực hiện hành động F12 (ví dụ chụp ảnh màn hình hoặc lệnh tùy chỉnh gắn với F12)
-                mc.keyboard.onKey(windowHandle, GLFW.GLFW_KEY_F12, 0, GLFW.GLFW_PRESS, 0);
-                mc.keyboard.onKey(windowHandle, GLFW.GLFW_KEY_F12, 0, GLFW.GLFW_RELEASE, 0);
+                mc.keyboard.onKey(win, GLFW.GLFW_KEY_F12, 0, GLFW.GLFW_PRESS, 0);
+                mc.keyboard.onKey(win, GLFW.GLFW_KEY_F12, 0, GLFW.GLFW_RELEASE, 0);
             }
             scheduleNextF12(now);
         }
@@ -98,7 +87,8 @@ public class WitherAuraClient implements ClientModInitializer {
         if (toggleTrig) {
             enabled = !enabled;
             target = null;
-            msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Silent - Màn hình cố định)" : "[WitherAura] ĐÃ TẮT", enabled ? Formatting.GREEN : Formatting.RED);
+            releaseTempKeys(mc, p);
+            msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Anti-Bot v5)" : "[WitherAura] ĐÃ TẮT", enabled ? Formatting.GREEN : Formatting.RED);
         }
         if (modeTrig) {
             boolean prev = cfg.onlyWither;
@@ -110,18 +100,44 @@ public class WitherAuraClient implements ClientModInitializer {
         }
 
         if (!enabled) return;
+
+        // Khôi phục phím chạy và phím ngồi giả lập
         if (holdingSprint && now >= sprintResume) {
             holdingSprint = false;
             if (mc.options.forwardKey.isPressed()) p.setSprinting(true);
         }
+        if (holdingSneak && now >= sneakResume) {
+            holdingSneak = false;
+            mc.options.sneakKey.setPressed( false );
+        }
+
         if (p.getHealth() <= cfg.minHealth || (cfg.panicPlayer && hasNearPlayer(mc, p))) {
             enabled = false;
             target = null;
-            msg(p, "[WitherAura] Tự tắt an toàn do máu thấp hoặc có người!", Formatting.RED);
+            releaseTempKeys(mc, p);
+            msg(p, "[WitherAura] Tự ngắt an toàn!", Formatting.RED);
             return;
         }
         if (mc.currentScreen != null) return;
-        if (now < breakUntil || now < postKillUntil) return;
+
+        // Cập nhật chu kỳ mỏi tay (Fatigue Wave) mỗi 25 - 75 giây để không bao giờ giữ nhịp CPS cố định
+        if (now >= nextFatigueShift) {
+            fatigueMultiplier = 0.82 + rng.nextDouble() * 0.55; // Dao động từ 82% đến 137% tốc độ gốc
+            nextFatigueShift = now + gauss(25000, 75000);
+        }
+
+        // Nhịp thở chuột liên tục (Chống cờ đỏ Yaw/Pitch cố định tuyệt đối)
+        applyHumanBreathingSway(mc, p);
+
+        if (now < breakUntil || now < postKillUntil) {
+            // Thỉnh thoảng nhấp Shift nhẹ hoặc lia mắt khi đang nghỉ giữa các đợt quái
+            if (rng.nextDouble() < 0.012 && !holdingSneak) {
+                holdingSneak = true;
+                mc.options.sneakKey.setPressed(true);
+                sneakResume = now + gauss(140, 420);
+            }
+            return;
+        }
 
         if (target != null && wasAlive && !target.isAlive()) {
             wasAlive = false;
@@ -129,7 +145,7 @@ public class WitherAuraClient implements ClientModInitializer {
             postKillUntil = now + gauss(cfg.minPostKillMs, cfg.maxPostKillMs);
             if (++kills >= killsGoal) {
                 kills = 0;
-                killsGoal = gauss(12, 24);
+                killsGoal = gauss(9, 22);
                 breakUntil = now + gauss(cfg.minBreakMs, cfg.maxBreakMs);
             }
             return;
@@ -141,7 +157,7 @@ public class WitherAuraClient implements ClientModInitializer {
             target = best;
             wasAlive = target.isAlive();
             acquireTime = now;
-            reactDelay = gauss(cfg.minReactMs, cfg.maxReactMs);
+            reactDelay = (long) (gauss(cfg.minReactMs, cfg.maxReactMs) * fatigueMultiplier);
             curRange = cfg.minRange + rng.nextDouble() * (cfg.maxRange - cfg.minRange);
             shiftAim(now);
         }
@@ -153,56 +169,122 @@ public class WitherAuraClient implements ClientModInitializer {
         if (cfg.autoSword) autoSwitchSword(p, now);
         if (isBroken(p.getMainHandStack())) return;
 
-        // Xoay góc nhìn ẢO (Silent Rotation) - Màn hình của bạn KHÔNG HỀ BỊ DI CHUYỂN
-        updateSilentRotation(p, visPt.add(aimOffset));
+        // Xoay tâm siêu nhẹ và chỉ xoay khi tia nhìn sắp lệch khỏi vùng an toàn của Hitbox
+        if (now >= rotPauseUntil) {
+            if (rng.nextDouble() < 0.07) rotPauseUntil = now + gauss(35, 110);
+            else rotateMinimalHuman(mc, p, target, visPt.add(aimOffset));
+        }
 
         if (now - acquireTime < reactDelay || now < lockAtkUntil || now < nextAtk) return;
-        if (p.getAttackCooldownProgress(0.5f) < (rng.nextDouble() < 0.7 ? 1.0f : 0.96f)) return;
 
-        // Kiểm tra tia nhìn ảo cắt qua Hitbox trước khi chém
+        // Ngưỡng chờ hồi chiêu biến thiên tự nhiên (không luôn cứng nhắc ở 100.0%)
+        float cdReq = rng.nextDouble() < 0.62 ? 1.0f : (0.92f + rng.nextFloat() * 0.08f);
+        if (p.getAttackCooldownProgress(0.5f) < cdReq) return;
+
+        // Kiểm tra tia nhìn cắt qua Hitbox thật trước khi đánh (Hợp lệ 100% với GrimAC)
         Vec3d eye = p.getEyePos();
-        Vec3d lookDir = Vec3d.fromPolar(clientPitch, clientYaw);
-        Vec3d lookEnd = eye.add(lookDir.multiply(curRange + 0.3));
-        if (target.getBoundingBox().expand(0.12).raycast(eye, lookEnd).isEmpty()) return;
+        Vec3d lookEnd = eye.add(p.getRotationVec(1.0f).multiply(curRange + 0.25));
+        if (target.getBoundingBox().expand(0.10).raycast(eye, lookEnd).isEmpty()) return;
 
+        // Mô phỏng người thật thỉnh thoảng bấm nhầm/vung kiếm hụt hoặc khựng tay vài giây
         if (rng.nextDouble() < cfg.missChance) {
             p.swingHand(Hand.MAIN_HAND);
-            nextAtk = now + gauss(210, 580);
+            nextAtk = now + gauss(280, 850);
             return;
         }
 
-        // Gửi gói tin đổi hướng ảo lên server ngay trước khi tấn công để vượt qua Anti-Cheat
-        p.networkHandler.sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(clientYaw, clientPitch, p.isOnGround(), p.horizontalCollision));
-
         mc.interactionManager.attackEntity(p, target);
         p.swingHand(Hand.MAIN_HAND);
+        attackStreak++;
 
-        if (cfg.sprintReset && p.isSprinting() && rng.nextDouble() < 0.65) {
+        if (cfg.sprintReset && p.isSprinting() && rng.nextDouble() < 0.58) {
             p.setSprinting(false);
             holdingSprint = true;
-            sprintResume = now + gauss(55, 135);
+            sprintResume = now + gauss(50, 155);
         }
 
-        long delay = Math.max(25, Math.round(cfg.meanDelayMs + rng.nextGaussian() * cfg.stdDelayMs));
-        if (rng.nextDouble() < 0.09) delay += gauss(200, 600);
-        nextAtk = now + delay;
+        // Tính toán độ trễ đòn tiếp theo bằng Phân phối Hỗn hợp (Bimodal Gaussian + Gián đoạn tự nhiên)
+        nextAtk = now + computeAntiMacroDelay();
     }
 
-    // Lên lịch ngẫu nhiên bấm F12 từ 5 phút (300,000 ms) đến 5 phút 20 giây (320,000 ms)
+    /**
+     * Thuật toán sinh độ trễ đa tầng chống phát hiện Macro / Auto-Clicker:
+     * Kết hợp phân phối chuẩn lệch + chu kỳ mỏi tay + gián đoạn bất quy tắc
+     */
+    private long computeAntiMacroDelay() {
+        double base = cfg.meanDelayMs * fatigueMultiplier;
+        double spread = cfg.stdDelayMs * (0.85 + rng.nextDouble() * 0.45);
+        long delay = Math.round(base + rng.nextGaussian() * spread);
+
+        // 15% cơ hội rơi vào nhịp bấm chậm hơn bình thường (mô phỏng phân phối 2 đỉnh của tay người)
+        if (rng.nextDouble() < 0.15) {
+            delay += gauss(110, 340);
+        }
+
+        // 5% cơ hội hoặc sau mỗi chuỗi đánh dài sẽ có nhịp khựng lớn (0.7s - 2.4s)
+        if (rng.nextDouble() < 0.05 || attackStreak > gauss(18, 35)) {
+            delay += gauss(700, 2400);
+            attackStreak = 0;
+        }
+
+        return Math.max(28, delay + rng.nextInt(17));
+    }
+
     private void scheduleNextF12(long now) {
-        long minMs = 5 * 60 * 1000L;       // 5 phút
-        long maxMs = (5 * 60 + 20) * 1000L; // 5 phút 20 giây
-        long randomMs = minMs + (long)(rng.nextDouble() * (maxMs - minMs));
-        nextF12Time = now + randomMs;
+        // Ngẫu nhiên từ 5 phút (300,000ms) đến 5 phút 20 giây (320,000ms) bằng phân phối Gaussian + Jitter
+        long baseMs = gauss(300000, 320000);
+        long subMsJitter = rng.nextInt(997) - 498;
+        nextF12Time = now + Math.clamp(baseMs + subMsJitter, 300000L, 320000L);
+    }
+
+    /**
+     * Chỉ xoay màn hình một góc cực nhỏ khi thật sự cần thiết.
+     * Nếu tâm ngắm đã nằm sẵn trong khung người quái thì giữ nguyên màn hình, chỉ thêm độ rung tay tự nhiên.
+     */
+    private void rotateMinimalHuman(MinecraftClient mc, ClientPlayerEntity p, LivingEntity e, Vec3d pt) {
+        Vec3d eye = p.getEyePos();
+        Vec3d lookEnd = eye.add(p.getRotationVec(1.0f).multiply(curRange + 0.2));
+        // Nếu tâm hiện tại đã chĩa trúng bên trong vùng lõi Hitbox -> Không kéo màn hình của người chơi
+        if (e.getBoundingBox().contract(0.08).raycast(eye, lookEnd).isPresent()) {
+            return;
+        }
+
+        float[] ang = angleTo(p, pt);
+        float yStep = cfg.minYaw + rng.nextFloat() * (cfg.maxYaw - cfg.minYaw);
+        float pStep = cfg.minPitch + rng.nextFloat() * (cfg.maxPitch - cfg.minPitch);
+        float dYaw = MathHelper.clamp(ang[2] * (0.35f + rng.nextFloat() * 0.25f), -yStep, yStep) + (float) (rng.nextGaussian() * 0.18f);
+        float dPitch = MathHelper.clamp(ang[3] * (0.30f + rng.nextFloat() * 0.22f), -pStep, pStep) + (float) (rng.nextGaussian() * 0.14f);
+
+        applyGcdRotation(mc, p, dYaw, dPitch);
+    }
+
+    /**
+     * Tạo dao động tay cầm chuột siêu nhỏ liên tục để tọa độ Yaw/Pitch không bao giờ đứng yên tuyệt đối
+     */
+    private void applyHumanBreathingSway(MinecraftClient mc, ClientPlayerEntity p) {
+        swayPhase += 0.09 + rng.nextDouble() * 0.07;
+        if (rng.nextDouble() < 0.42) {
+            float swayYaw = (float) (Math.sin(swayPhase) * 0.08 + rng.nextGaussian() * 0.11);
+            float swayPitch = (float) (Math.cos(swayPhase * 0.8) * 0.06 + rng.nextGaussian() * 0.08);
+            applyGcdRotation(mc, p, swayYaw, swayPitch);
+        }
+    }
+
+    private void applyGcdRotation(MinecraftClient mc, ClientPlayerEntity p, float dYaw, float dPitch) {
+        float gcd = getGcd(mc);
+        float fixedYaw = dYaw - (dYaw % gcd);
+        float fixedPitch = dPitch - (dPitch % gcd);
+        p.setYaw(p.getYaw() + fixedYaw);
+        p.setPitch(MathHelper.clamp(p.getPitch() + fixedPitch, -89.9f, 89.9f));
     }
 
     private LivingEntity findTarget(MinecraftClient mc, ClientPlayerEntity p) {
-        double rSq = (curRange + 0.4) * (curRange + 0.4);
+        double rSq = (curRange + 0.35) * (curRange + 0.35);
         return StreamSupport.stream(mc.world.getEntities().spliterator(), false)
                 .filter(e -> e != p && e instanceof LivingEntity le && le.isAlive() && !e.isRemoved() && validMob(le))
                 .map(e -> (LivingEntity) e)
                 .filter(e -> getClosestPoint(p.getEyePos(), e.getBoundingBox()).squaredDistanceTo(p.getEyePos()) <= rSq)
-                .filter(e -> angleTo(p.getEyePos(), p.getYaw(), p.getPitch(), e.getBoundingBox().getCenter())[0] <= cfg.fov * 0.5f)
+                .filter(e -> angleTo(p, e.getBoundingBox().getCenter())[0] <= cfg.fov * 0.5f)
                 .filter(e -> getVisiblePoint(mc, p, e) != null)
                 .min(Comparator.comparingDouble(e -> "HEALTH".equalsIgnoreCase(cfg.priority) ? e.getHealth() : e.squaredDistanceTo(p)))
                 .orElse(null);
@@ -216,9 +298,9 @@ public class WitherAuraClient implements ClientModInitializer {
         Vec3d eye = p.getEyePos();
         Box b = e.getBoundingBox();
         Vec3d closest = getClosestPoint(eye, b);
-        for (double f : new double[]{0.55, 0.30, 0.75, 0.15, 0.85}) {
+        for (double f : new double[]{0.52, 0.32, 0.72, 0.18, 0.84}) {
             Vec3d pt = new Vec3d(MathHelper.lerp(0.35, closest.x, b.getCenter().x), b.minY + b.getLengthY() * f, MathHelper.lerp(0.35, closest.z, b.getCenter().z));
-            if (eye.squaredDistanceTo(pt) <= (curRange + 0.35) * (curRange + 0.35)) {
+            if (eye.squaredDistanceTo(pt) <= (curRange + 0.3) * (curRange + 0.3)) {
                 if (mc.world.raycast(new RaycastContext(eye, pt, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, p)).getType() == HitResult.Type.MISS)
                     return pt;
             }
@@ -230,24 +312,11 @@ public class WitherAuraClient implements ClientModInitializer {
         return new Vec3d(MathHelper.clamp(pos.x, box.minX, box.maxX), MathHelper.clamp(pos.y, box.minY, box.maxY), MathHelper.clamp(pos.z, box.minZ, box.maxZ));
     }
 
-    // Xoay góc nhìn ảo mượt mà từng bước mà không làm dịch chuyển camera game của bạn
-    private void updateSilentRotation(ClientPlayerEntity p, Vec3d pt) {
-        float[] ang = angleTo(p.getEyePos(), clientYaw, clientPitch, pt);
-        if (ang[0] < 2.0f && ang[1] < 2.0f) return;
-        float yStep = cfg.minYaw + rng.nextFloat() * (cfg.maxYaw - cfg.minYaw);
-        float pStep = cfg.minPitch + rng.nextFloat() * (cfg.maxPitch - cfg.minPitch);
-        float dYaw = MathHelper.clamp(ang[2] * 0.6f, -yStep, yStep) + (float)(rng.nextGaussian() * 0.12f);
-        float dPitch = MathHelper.clamp(ang[3] * 0.6f, -pStep, pStep) + (float)(rng.nextGaussian() * 0.1f);
-        
-        clientYaw += dYaw;
-        clientPitch = MathHelper.clamp(clientPitch + dPitch, -89.9f, 89.9f);
-    }
-
-    private float[] angleTo(Vec3d eye, float curYaw, float curPitch, Vec3d pt) {
-        Vec3d d = pt.subtract(eye);
+    private float[] angleTo(ClientPlayerEntity p, Vec3d pt) {
+        Vec3d d = pt.subtract(p.getEyePos());
         float tYaw = (float) (MathHelper.atan2(d.z, d.x) * (180.0 / Math.PI)) - 90.0f;
         float tPitch = (float) (-(MathHelper.atan2(d.y, Math.sqrt(d.x * d.x + d.z * d.z)) * (180.0 / Math.PI)));
-        float dy = MathHelper.wrapDegrees(tYaw - curYaw), dp = MathHelper.wrapDegrees(tPitch - curPitch);
+        float dy = MathHelper.wrapDegrees(tYaw - p.getYaw()), dp = MathHelper.wrapDegrees(tPitch - p.getPitch());
         return new float[]{Math.abs(dy), Math.abs(dp), dy, dp};
     }
 
@@ -261,11 +330,11 @@ public class WitherAuraClient implements ClientModInitializer {
             }
         }
         if (best == -1 || p.getInventory().selectedSlot == best) { pendingSlot = -1; return; }
-        if (pendingSlot != best) { pendingSlot = best; switchTime = now + gauss(80, 210); return; }
+        if (pendingSlot != best) { pendingSlot = best; switchTime = now + gauss(95, 245); return; }
         if (now >= switchTime) {
             p.getInventory().selectedSlot = pendingSlot;
             pendingSlot = -1;
-            lockAtkUntil = now + gauss(80, 210);
+            lockAtkUntil = now + gauss(95, 240);
         }
     }
 
@@ -282,12 +351,25 @@ public class WitherAuraClient implements ClientModInitializer {
 
     private void shiftAim(long now) {
         double r = cfg.aimOffset;
-        aimOffset = new Vec3d(rng.nextGaussian() * r * 0.4, rng.nextGaussian() * r * 0.3, rng.nextGaussian() * r * 0.4);
-        nextShift = now + gauss(160, 400);
+        aimOffset = new Vec3d(rng.nextGaussian() * r * 0.45, rng.nextGaussian() * r * 0.35, rng.nextGaussian() * r * 0.45);
+        nextShift = now + gauss(130, 440);
+    }
+
+    private void releaseTempKeys(MinecraftClient mc, ClientPlayerEntity p) {
+        holdingSprint = false;
+        if (holdingSneak) {
+            holdingSneak = false;
+            mc.options.sneakKey.setPressed(false);
+        }
+    }
+
+    private float getGcd(MinecraftClient mc) {
+        double f = mc.options.getMouseSensitivity().getValue() * 0.6 + 0.2;
+        return (float) (f * f * f * 1.2);
     }
 
     private int gauss(int min, int max) {
-        return min >= max ? min : MathHelper.clamp((int) Math.round((min + max) / 2.0 + rng.nextGaussian() * ((max - min) / 4.0)), min, max);
+        return min >= max ? min : MathHelper.clamp((int) Math.round((min + max) / 2.0 + rng.nextGaussian() * ((max - min) / 3.8)), min, max);
     }
 
     private void msg(ClientPlayerEntity p, String text, Formatting color) {
@@ -302,9 +384,9 @@ public class WitherAuraClient implements ClientModInitializer {
         private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "wither_aura.json");
         public boolean onlyWither = true, autoSword = true, sprintReset = true, panicPlayer = false, silentMode = false;
         public String priority = "DISTANCE";
-        public double minRange = 2.90, maxRange = 3.05, aimOffset = 0.14, missChance = 0.03, panicRadius = 15.0;
-        public float fov = 170.0f, minYaw = 18.0f, maxYaw = 36.0f, minPitch = 12.0f, maxPitch = 25.0f, minHealth = 6.0f;
-        public int meanDelayMs = 80, stdDelayMs = 42, minReactMs = 100, maxReactMs = 240, minPostKillMs = 85, maxPostKillMs = 240, minBreakMs = 1500, maxBreakMs = 3800, minDurability = 10;
+        public double minRange = 2.82, maxRange = 2.98, aimOffset = 0.16, missChance = 0.04, panicRadius = 15.0;
+        public float fov = 150.0f, minYaw = 11.0f, maxYaw = 26.0f, minPitch = 8.0f, maxPitch = 19.0f, minHealth = 6.0f;
+        public int meanDelayMs = 95, stdDelayMs = 52, minReactMs = 120, maxReactMs = 290, minPostKillMs = 110, maxPostKillMs = 310, minBreakMs = 1800, maxBreakMs = 4800, minDurability = 12;
 
         public static ModConfig load() {
             if (FILE.exists()) try (FileReader r = new FileReader(FILE)) { return GSON.fromJson(r, ModConfig.class); } catch (Exception ignored) {}
@@ -313,3 +395,4 @@ public class WitherAuraClient implements ClientModInitializer {
         public void save() { try (FileWriter w = new FileWriter(FILE)) { GSON.toJson(this, w); } catch (Exception ignored) {} }
     }
             }
+    
