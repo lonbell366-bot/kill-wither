@@ -29,6 +29,11 @@ import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.SwordItem;
 import net.minecraft.registry.tag.ItemTags;
+import net.minecraft.scoreboard.Scoreboard;
+import net.minecraft.scoreboard.ScoreboardDisplaySlot;
+import net.minecraft.scoreboard.ScoreboardEntry;
+import net.minecraft.scoreboard.ScoreboardObjective;
+import net.minecraft.scoreboard.Team;
 import net.minecraft.sound.SoundEvents;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
@@ -57,11 +62,14 @@ public class WitherAuraClient implements ClientModInitializer {
     private LivingEntity target = null;
     private Vec3d aimOffset = Vec3d.ZERO;
 
-    private long sessionStartTime = 0, acquireTime, reactDelay, nextShift, nextAtk, switchTime, lockAtkUntil, sprintResume, nextF12Time = 0, scheduledPayTime = 0;
-    private double pendingPayAmount = 0.0, curRange = 2.95, swayPhase = 0.0, totalMoney = 0.0, payPoolMoney = 0.0;
+    private long sessionStartTime = 0, acquireTime, reactDelay, nextShift, nextAtk, switchTime, lockAtkUntil, sprintResume, nextF12Time = 0;
+    private long scheduledPayTime = 0, lastPayExecTime = 0;
+    private double pendingPayAmount = 0.0, curRange = 2.95, swayPhase = 0.0;
+    private double totalMoney = 0.0, currentBalance = 0.0, totalPaidMoney = 0.0;
     private int pendingSlot = -1;
 
     private static final Pattern MONEY_PATTERN = Pattern.compile("\\$\\s*([0-9]+(?:[.,][0-9]+)?)\\s*([kKmMbB]?)");
+    private static final Pattern SB_BALANCE_PATTERN = Pattern.compile("(?:^|Money:?\\s*|Balance:?\\s*|\\s)\\$\\s*([0-9]+(?:[.,][0-9]+)?)\\s*([kKmMbB]?)(?:\\b|$)", Pattern.CASE_INSENSITIVE);
 
     @Override
     public void onInitializeClient() {
@@ -82,9 +90,54 @@ public class WitherAuraClient implements ClientModInitializer {
     public void resetSessionStats() {
         sessionStartTime = System.currentTimeMillis();
         totalMoney = 0.0;
-        payPoolMoney = 0.0;
+        currentBalance = 0.0;
+        totalPaidMoney = 0.0;
         scheduledPayTime = 0;
         pendingPayAmount = 0.0;
+    }
+
+    private double extractMoneyValue(String numStr, String unitStr) {
+        double v = Double.parseDouble(numStr.replace(",", ""));
+        String u = unitStr.toUpperCase(Locale.ROOT);
+        if ("K".equals(u)) v *= 1e3;
+        else if ("M".equals(u)) v *= 1e6;
+        else if ("B".equals(u)) v *= 1e9;
+        return v;
+    }
+
+    // Quét trực tiếp số tiền hiện có trên bảng Scoreboard của server (VD: "$ 300K", "$ 35.2M")
+    private void updateBalanceFromScoreboard(MinecraftClient mc) {
+        if (mc.world == null || System.currentTimeMillis() - lastPayExecTime < 4000) return;
+        Scoreboard sb = mc.world.getScoreboard();
+        ScoreboardObjective obj = sb.getObjectiveForSlot(ScoreboardDisplaySlot.SIDEBAR);
+        if (obj != null) {
+            for (ScoreboardEntry entry : sb.getScoreboardEntries(obj)) {
+                Team team = sb.getScoreHolderTeam(entry.owner());
+                String line = Formatting.strip(Team.decorateName(team, entry.name()).getString());
+                if (tryParseBalanceLine(line)) return;
+            }
+        }
+        for (Team team : sb.getTeams()) {
+            String line = Formatting.strip(team.getPrefix().getString() + team.getSuffix().getString());
+            if (tryParseBalanceLine(line)) return;
+        }
+    }
+
+    private boolean tryParseBalanceLine(String clean) {
+        if (clean == null || !clean.contains("$")) return false;
+        String low = clean.toLowerCase(Locale.ROOT);
+        if (low.contains("bounty") || low.contains("worth") || low.contains("price")) return false;
+        Matcher m = SB_BALANCE_PATTERN.matcher(clean.trim());
+        if (m.find()) {
+            try {
+                double val = extractMoneyValue(m.group(1), m.group(2));
+                if (val >= 0) {
+                    currentBalance = val;
+                    return true;
+                }
+            } catch (Exception ignored) {}
+        }
+        return false;
     }
 
     private void parseMoneyChat(String raw) {
@@ -92,18 +145,20 @@ public class WitherAuraClient implements ClientModInitializer {
         String clean = Formatting.strip(raw);
         if (clean == null) return;
         String low = clean.toLowerCase(Locale.ROOT);
-        if (low.contains("paid ") || low.contains("sent ") || low.contains("đã chuyển")) return;
+
         Matcher m = MONEY_PATTERN.matcher(clean);
-        if (m.find()) {
-            try {
-                double v = Double.parseDouble(m.group(1).replace(",", ""));
-                String u = m.group(2).toUpperCase(Locale.ROOT);
-                if ("K".equals(u)) v *= 1e3;
-                else if ("M".equals(u)) v *= 1e6;
-                else if ("B".equals(u)) v *= 1e9;
-                if (v > 0) { totalMoney += v; payPoolMoney += v; }
-            } catch (Exception ignored) {}
-        }
+        if (!m.find()) return;
+        try {
+            double v = extractMoneyValue(m.group(1), m.group(2));
+            if (v <= 0) return;
+            if (low.contains("balance") || low.contains("số dư") || low.contains("you have $")) {
+                currentBalance = v;
+                return;
+            }
+            if (low.contains("paid ") || low.contains("sent ") || low.contains("đã chuyển")) return;
+            totalMoney += v;
+            currentBalance += v; // Cộng tạm vào số dư hiện có nếu Scoreboard chưa kịp nhảy
+        } catch (Exception ignored) {}
     }
 
     private void renderHud(DrawContext ctx, RenderTickCounter tc) {
@@ -112,22 +167,26 @@ public class WitherAuraClient implements ClientModInitializer {
         long ms = Math.max(1000L, System.currentTimeMillis() - sessionStartTime);
         double perHour = totalMoney / (ms / 3600000.0);
         String l1 = "⏱ Thời gian: " + formatDuration(ms);
-        String l2 = "💰 Farm/giờ: $" + formatMoney(perHour) + "/h (Tổng: $" + formatMoney(totalMoney) + ")";
-        String l3 = "💸 Tự Pay (" + (cfg.autoPay ? "BẬT" : "TẮT") + "): $" + formatMoney(payPoolMoney) + " / $" + formatMoney(cfg.payTrigger) + " -> " + (cfg.payTarget.isBlank() ? "Chưa đặt" : cfg.payTarget);
-        String l4 = "⚔ KillAura: " + (enabled ? "BẬT" : "TẮT") + (cfg.onlyWither ? " [Wither]" : " [Mọi Quái]") + " | [F9] Setting";
-        int w = Math.max(Math.max(mc.textRenderer.getWidth(l1), mc.textRenderer.getWidth(l2)), Math.max(mc.textRenderer.getWidth(l3), mc.textRenderer.getWidth(l4))) + 14;
-        ctx.fill(5, 5, 5 + w, 56, 0xCC0D1017);
-        ctx.fill(5, 5, 7, 56, 0xFF00E5FF);
+        String l2 = "💰 Farm/giờ: $" + formatMoney(perHour) + "/h (Tổng Farm: $" + formatMoney(totalMoney) + ")";
+        String l3 = "💸 Số dư Pay (" + (cfg.autoPay ? "BẬT" : "TẮT") + "): $" + formatMoney(currentBalance) + " / $" + formatMoney(cfg.payTrigger) + " -> " + (cfg.payTarget.isBlank() ? "Chưa đặt" : cfg.payTarget);
+        String l4 = "✅ Tổng đã Pay: $" + formatMoney(totalPaidMoney);
+        String l5 = "⚔ KillAura: " + (enabled ? "BẬT" : "TẮT") + (cfg.onlyWither ? " [Wither]" : " [Mọi Quái]") + " | [F9] Setting";
+        int w = Math.max(mc.textRenderer.getWidth(l1), Math.max(mc.textRenderer.getWidth(l2), Math.max(mc.textRenderer.getWidth(l3), Math.max(mc.textRenderer.getWidth(l4), mc.textRenderer.getWidth(l5))))) + 14;
+        ctx.fill(5, 5, 5 + w, 67, 0xCC0D1017);
+        ctx.fill(5, 5, 7, 67, 0xFF00E5FF);
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l1), 11, 9, 0xE0F7FA);
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l2), 11, 20, 0x69F0AE);
         ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l3), 11, 31, 0xFFD740);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l4), 11, 42, enabled ? 0x00E5FF : 0xFF5252);
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l4), 11, 42, 0xEA80FC);
+        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l5), 11, 53, enabled ? 0x00E5FF : 0xFF5252);
     }
 
     private void tick(MinecraftClient mc) {
         if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
         ClientPlayerEntity p = mc.player;
         long win = mc.getWindow().getHandle(), now = System.currentTimeMillis();
+
+        updateBalanceFromScoreboard(mc);
 
         if (nextF12Time == 0) nextF12Time = now + gauss(300000, 320000);
         else if (now >= nextF12Time) {
@@ -184,32 +243,45 @@ public class WitherAuraClient implements ClientModInitializer {
         p.swingHand(Hand.MAIN_HAND);
         if (cfg.sprintReset && p.isSprinting() && rng.nextDouble() < 0.60) { p.setSprinting(false); holdingSprint = true; sprintResume = now + gauss(45, 115); }
         nextAtk = now + gauss(cfg.minAttackJitterMs, cfg.maxAttackJitterMs);
-                                                           }
-          private void handleAutoPay(MinecraftClient mc, ClientPlayerEntity p, long now) {
+    }
+        private void handleAutoPay(MinecraftClient mc, ClientPlayerEntity p, long now) {
         if (!cfg.autoPay || cfg.payTarget == null || cfg.payTarget.trim().isEmpty()) return;
-        if (scheduledPayTime == 0 && payPoolMoney >= cfg.payTrigger) {
+        // Chờ ít nhất 8 giây sau lần pay trước để Scoreboard kịp cập nhật số dư thật
+        if (now - lastPayExecTime < 8000) return;
+
+        if (scheduledPayTime == 0 && currentBalance >= cfg.payTrigger) {
             double minP = Math.min(cfg.payMin, cfg.payMax), maxP = Math.max(cfg.payMin, cfg.payMax);
-            pendingPayAmount = minP + rng.nextDouble() * (maxP - minP);
+            double rawAmt = minP + rng.nextDouble() * (maxP - minP);
+            pendingPayAmount = Math.min(rawAmt, currentBalance); // Đảm bảo không pay vượt quá số tiền đang có
             scheduledPayTime = now + gauss(1800, 4500);
         }
         if (scheduledPayTime > 0 && now >= scheduledPayTime && mc.currentScreen == null) {
             executePayCommand(p, pendingPayAmount);
-            payPoolMoney = Math.max(0.0, payPoolMoney - pendingPayAmount);
-            scheduledPayTime = 0; pendingPayAmount = 0.0;
+            lastPayExecTime = now;
+            scheduledPayTime = 0;
+            pendingPayAmount = 0.0;
             lockAtkUntil = now + gauss(350, 750);
         }
     }
 
     public void executePayCommand(ClientPlayerEntity p, double amount) {
         if (cfg.payTarget == null || cfg.payTarget.trim().isEmpty()) { msg(p, "[WitherAura] Chưa nhập tên người nhận (F9)!", Formatting.RED); return; }
+        double actualPaid;
         String amtStr;
         if (cfg.useShortPayFormat && amount >= 1e6) {
             double m = Math.round((amount / 1e6) * 10.0) / 10.0;
+            actualPaid = m * 1e6;
             amtStr = (m == (long) m) ? String.format(Locale.US, "%dM", (long) m) : String.format(Locale.US, "%.1fM", m);
-        } else amtStr = String.valueOf(Math.round(amount));
+        } else {
+            long rounded = Math.round(amount);
+            actualPaid = rounded;
+            amtStr = String.valueOf(rounded);
+        }
+        totalPaidMoney += actualPaid;
+        currentBalance = Math.max(0.0, currentBalance - actualPaid); // Trừ trực tiếp vào số dư đang có
         String cmd = "pay " + cfg.payTarget.trim() + " " + amtStr;
         p.networkHandler.sendChatCommand(cmd);
-        msg(p, "[WitherAura] Đã chuyển: /" + cmd, Formatting.AQUA);
+        msg(p, "[WitherAura] Đã chuyển: /" + cmd + " | Còn lại: $" + formatMoney(currentBalance), Formatting.AQUA);
     }
 
     private boolean isEatingOrHoldingFood(MinecraftClient mc, ClientPlayerEntity p) {
@@ -344,7 +416,7 @@ public class WitherAuraClient implements ClientModInitializer {
             this.addDrawableChild(ButtonWidget.builder(txtAura(), b -> { mod.enabled = !mod.enabled; b.setMessage(txtAura()); }).dimensions(L, cy + 40, 150, 20).build());
             this.addDrawableChild(ButtonWidget.builder(txtMode(), b -> { cfg.onlyWither = !cfg.onlyWither; b.setMessage(txtMode()); }).dimensions(R, cy + 40, 150, 20).build());
             this.addDrawableChild(ButtonWidget.builder(txtHud(), b -> { cfg.showHud = !cfg.showHud; b.setMessage(txtHud()); }).dimensions(L, cy + 64, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(Text.literal("🔄 Reset Thời Gian & $/h").formatted(Formatting.YELLOW), b -> mod.resetSessionStats()).dimensions(R, cy + 64, 150, 20).build());
+            this.addDrawableChild(ButtonWidget.builder(Text.literal("🔄 Reset Toàn Bộ Thống Kê").formatted(Formatting.YELLOW), b -> mod.resetSessionStats()).dimensions(R, cy + 64, 150, 20).build());
             this.addDrawableChild(ButtonWidget.builder(Text.literal("💸 Test Pay Ngay").formatted(Formatting.AQUA), b -> {
                 saveInputs();
                 if (this.client != null && this.client.player != null) {
@@ -360,7 +432,7 @@ public class WitherAuraClient implements ClientModInitializer {
             f.setMaxLength(32); f.setText(val); return this.addDrawableChild(f);
         }
         private Text txtPay() { return Text.literal("Auto Pay: " + (cfg.autoPay ? "BẬT ✔" : "TẮT ✖")).formatted(cfg.autoPay ? Formatting.GREEN : Formatting.RED); }
-        private Text txtFmt() { return Text.literal("Kiểu lệnh: " + (cfg.useShortPayFormat ? "52.5M (Gọn)" : "Số nguyên")).formatted(Formatting.AQUA); }
+        private Text txtFmt() { return Text.literal("Kiểu lệnh: " + (cfg.useShortPayFormat ? "32.5M (Gọn)" : "Số nguyên")).formatted(Formatting.AQUA); }
         private Text txtAura() { return Text.literal("KillAura (Z): " + (mod.enabled ? "BẬT ✔" : "TẮT ✖")).formatted(mod.enabled ? Formatting.GREEN : Formatting.RED); }
         private Text txtMode() { return Text.literal("Mục tiêu: " + (cfg.onlyWither ? "Chỉ Wither" : "Mọi Quái")).formatted(Formatting.GOLD); }
         private Text txtHud() { return Text.literal("Bảng HUD: " + (cfg.showHud ? "HIỆN ✔" : "ẨN ✖")).formatted(cfg.showHud ? Formatting.GREEN : Formatting.GRAY); }
@@ -386,21 +458,21 @@ public class WitherAuraClient implements ClientModInitializer {
             int cx = this.width / 2, cy = this.height / 2, L = cx - 155, R = cx + 5;
             String title = "⚡ WITHER AURA & AUTO PAY PANEL ⚡";
             ctx.drawTextWithShadow(this.textRenderer, Text.literal(title).formatted(Formatting.AQUA, Formatting.BOLD), cx - this.textRenderer.getWidth(title) / 2, cy - 105, 0x00E5FF);
-            String st = "Đã Farm: $" + formatMoney(mod.totalMoney) + " | Quỹ chờ Pay: $" + formatMoney(mod.payPoolMoney) + " / $" + formatMoney(cfg.payTrigger);
+            String st = "Số dư: $" + formatMoney(mod.currentBalance) + "/$" + formatMoney(cfg.payTrigger) + " | Đã Pay: $" + formatMoney(mod.totalPaidMoney);
             ctx.drawTextWithShadow(this.textRenderer, Text.literal(st), cx - this.textRenderer.getWidth(st) / 2, cy - 80, 0x69F0AE);
             ctx.drawTextWithShadow(this.textRenderer, Text.literal("👤 Tên người nhận (/pay):"), L, cy - 64, 0xB0BEC5);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal("🎯 Mốc kích hoạt (VD: 60M):"), R, cy - 64, 0xB0BEC5);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬇ Pay Tối Thiểu (VD: 50M):"), L, cy - 24, 0xB0BEC5);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬆ Pay Tối Đa (VD: 55M):"), R, cy - 24, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("🎯 Mốc Số Dư kích hoạt (VD: 35M):"), R, cy - 64, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬇ Pay Tối Thiểu (VD: 30M):"), L, cy - 24, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬆ Pay Tối Đa (VD: 35M):"), R, cy - 24, 0xB0BEC5);
         }
     }
 
     public static class ModConfig {
         private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-        private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "wither_aura_v7.json");
+        private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "wither_aura_v8.json");
         public boolean onlyWither = true, autoSword = true, sprintReset = true, panicPlayer = false, silentMode = false, showHud = true, autoPay = true, useShortPayFormat = true;
         public String payTarget = "", priority = "DISTANCE";
-        public double payTrigger = 60e6, payMin = 50e6, payMax = 55e6, minRange = 2.85, maxRange = 3.00, aimOffset = 0.15, panicRadius = 15.0;
+        public double payTrigger = 35e6, payMin = 30e6, payMax = 35e6, minRange = 2.85, maxRange = 3.00, aimOffset = 0.15, panicRadius = 15.0;
         public float fov = 160.0f, minYaw = 14.0f, maxYaw = 30.0f, minPitch = 10.0f, maxPitch = 22.0f, minHealth = 6.0f;
         public int minAttackJitterMs = 15, maxAttackJitterMs = 65, minReactMs = 30, maxReactMs = 85, minDurability = 12;
 
@@ -410,5 +482,5 @@ public class WitherAuraClient implements ClientModInitializer {
         }
         public void save() { try (FileWriter w = new FileWriter(FILE)) { GSON.toJson(this, w); } catch (Exception ignored) {} }
     }
-            }
-                
+    }
+                    
