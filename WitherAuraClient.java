@@ -46,27 +46,28 @@ import net.minecraft.world.RaycastContext;
 import org.lwjgl.glfw.GLFW;
 
 import java.io.*;
-import java.util.Comparator;
+import java.util.List;
 import java.util.Locale;
 import java.util.Random;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import java.util.stream.StreamSupport;
 
 public class WitherAuraClient implements ClientModInitializer {
     private static ModConfig cfg;
     private static KeyBinding keyZ, keyX, keyF9;
     private final Random rng = new Random();
 
-    private boolean enabled = false, zWasDown = false, xWasDown = false, f9WasDown = false, holdingSprint = false;
+    private boolean enabled = false, zWasDown = false, xWasDown = false, f9WasDown = false, holdingSprint = false, noRenderApplied = false;
+    private int savedViewDist = 8, savedBiomeBlend = 2, pendingSlot = -1, tickCount = 0, hudWidth = 180;
+    private double savedEntityScale = 1.0, pendingPayAmount = 0.0, curRange = 2.95, swayPhase = 0.0;
+    private double totalMoney = 0.0, currentBalance = 0.0, totalPaidMoney = 0.0;
+    private boolean savedShadows = true, savedBob = true, savedAo = true;
+    private String hudL1 = "", hudL2 = "", hudL3 = "", hudL4 = "", hudL5 = "";
+
     private LivingEntity target = null;
     private Vec3d aimOffset = Vec3d.ZERO;
-
     private long sessionStartTime = 0, acquireTime, reactDelay, nextShift, nextAtk, switchTime, lockAtkUntil, sprintResume, nextF12Time = 0;
     private long scheduledPayTime = 0, lastPayExecTime = 0;
-    private double pendingPayAmount = 0.0, curRange = 2.95, swayPhase = 0.0;
-    private double totalMoney = 0.0, currentBalance = 0.0, totalPaidMoney = 0.0;
-    private int pendingSlot = -1;
 
     private static final Pattern MONEY_PATTERN = Pattern.compile("\\$\\s*([0-9]+(?:[.,][0-9]+)?)\\s*([kKmMbB]?)");
     private static final Pattern SB_BALANCE_PATTERN = Pattern.compile("(?:^|Money:?\\s*|Balance:?\\s*|\\s)\\$\\s*([0-9]+(?:[.,][0-9]+)?)\\s*([kKmMbB]?)(?:\\b|$)", Pattern.CASE_INSENSITIVE);
@@ -96,6 +97,34 @@ public class WitherAuraClient implements ClientModInitializer {
         pendingPayAmount = 0.0;
     }
 
+    public void syncNoRenderOptions(MinecraftClient mc) {
+        if (mc.options == null) return;
+        if (cfg.noRender && !noRenderApplied) {
+            savedViewDist = mc.options.getViewDistance().getValue();
+            savedEntityScale = mc.options.getEntityDistanceScaling().getValue();
+            savedShadows = mc.options.getEntityShadows().getValue();
+            savedBob = mc.options.getBobView().getValue();
+            savedAo = mc.options.getAo().getValue();
+            savedBiomeBlend = mc.options.getBiomeBlendRadius().getValue();
+
+            mc.options.getViewDistance().setValue(2);
+            mc.options.getEntityDistanceScaling().setValue(0.5);
+            mc.options.getEntityShadows().setValue(false);
+            mc.options.getBobView().setValue(false);
+            mc.options.getAo().setValue(false);
+            mc.options.getBiomeBlendRadius().setValue(0);
+            noRenderApplied = true;
+        } else if (!cfg.noRender && noRenderApplied) {
+            mc.options.getViewDistance().setValue(savedViewDist);
+            mc.options.getEntityDistanceScaling().setValue(savedEntityScale);
+            mc.options.getEntityShadows().setValue(savedShadows);
+            mc.options.getBobView().setValue(savedBob);
+            mc.options.getAo().setValue(savedAo);
+            mc.options.getBiomeBlendRadius().setValue(savedBiomeBlend);
+            noRenderApplied = false;
+        }
+    }
+
     private double extractMoneyValue(String numStr, String unitStr) {
         double v = Double.parseDouble(numStr.replace(",", ""));
         String u = unitStr.toUpperCase(Locale.ROOT);
@@ -109,38 +138,26 @@ public class WitherAuraClient implements ClientModInitializer {
         if (mc.world == null || System.currentTimeMillis() - lastPayExecTime < 4000) return;
         Scoreboard sb = mc.world.getScoreboard();
         ScoreboardObjective obj = sb.getObjectiveForSlot(ScoreboardDisplaySlot.SIDEBAR);
-        if (obj != null) {
-            for (ScoreboardEntry entry : sb.getScoreboardEntries(obj)) {
-                Team team = sb.getScoreHolderTeam(entry.owner());
-                String line = Formatting.strip(Team.decorateName(team, entry.name()).getString());
-                if (tryParseBalanceLine(line)) return;
+        if (obj == null) return;
+        int checked = 0;
+        for (ScoreboardEntry entry : sb.getScoreboardEntries(obj)) {
+            if (++checked > 15) break;
+            Team team = sb.getScoreHolderTeam(entry.owner());
+            String line = Formatting.strip(Team.decorateName(team, entry.name()).getString());
+            if (line != null && line.contains("$")) {
+                Matcher m = SB_BALANCE_PATTERN.matcher(line.trim());
+                if (m.find()) {
+                    try {
+                        currentBalance = extractMoneyValue(m.group(1), m.group(2));
+                        return;
+                    } catch (Exception ignored) {}
+                }
             }
         }
-        for (Team team : sb.getTeams()) {
-            String line = Formatting.strip(team.getPrefix().getString() + team.getSuffix().getString());
-            if (tryParseBalanceLine(line)) return;
-        }
-    }
-
-    private boolean tryParseBalanceLine(String clean) {
-        if (clean == null || !clean.contains("$")) return false;
-        String low = clean.toLowerCase(Locale.ROOT);
-        if (low.contains("bounty") || low.contains("worth") || low.contains("price")) return false;
-        Matcher m = SB_BALANCE_PATTERN.matcher(clean.trim());
-        if (m.find()) {
-            try {
-                double val = extractMoneyValue(m.group(1), m.group(2));
-                if (val >= 0) {
-                    currentBalance = val;
-                    return true;
-                }
-            } catch (Exception ignored) {}
-        }
-        return false;
     }
 
     private void parseMoneyChat(String raw) {
-        if (raw == null || raw.contains("[WitherAura]")) return;
+        if (raw == null || !raw.contains("$") || raw.contains("[WitherAura]")) return;
         String clean = Formatting.strip(raw);
         if (clean == null) return;
         String low = clean.toLowerCase(Locale.ROOT);
@@ -160,54 +177,45 @@ public class WitherAuraClient implements ClientModInitializer {
         } catch (Exception ignored) {}
     }
 
+    private void updateHudCache(MinecraftClient mc) {
+        long ms = Math.max(1000L, System.currentTimeMillis() - sessionStartTime);
+        double perHour = totalMoney / (ms / 3600000.0);
+        hudL1 = "⏱ Thời gian: " + formatDuration(ms);
+        hudL2 = "💰 Farm/giờ: $" + formatMoney(perHour) + "/h (Tổng: $" + formatMoney(totalMoney) + ")";
+        hudL3 = "💸 Số dư Pay (" + (cfg.autoPay ? "BẬT" : "TẮT") + "): $" + formatMoney(currentBalance) + " / $" + formatMoney(cfg.payTrigger);
+        hudL4 = "✅ Đã Pay: $" + formatMoney(totalPaidMoney) + " -> " + (cfg.payTarget.isBlank() ? "Chưa đặt" : cfg.payTarget);
+        hudL5 = "⚔ KillAura: " + (enabled ? "BẬT" : "TẮT") + (cfg.onlyWither ? " [Wither]" : " [Mọi Quái]") + " | [F9] Menu";
+        hudWidth = Math.max(mc.textRenderer.getWidth(hudL1), Math.max(mc.textRenderer.getWidth(hudL2),
+                Math.max(mc.textRenderer.getWidth(hudL3), Math.max(mc.textRenderer.getWidth(hudL4), mc.textRenderer.getWidth(hudL5))))) + 14;
+    }
+
     private void renderHud(DrawContext ctx, RenderTickCounter tc) {
         MinecraftClient mc = MinecraftClient.getInstance();
         if (mc.player == null || mc.options.hudHidden) return;
 
-        int sw = ctx.getScaledWindowWidth();
-        int sh = ctx.getScaledWindowHeight();
-
-        // CHẾ ĐỘ NO RENDER: Ẩn toàn bộ thế giới 3D/quái/hạt phía sau màn hình Cyber Dark siêu gọn đẹp
         if (cfg.noRender && mc.currentScreen == null) {
-            ctx.fill(0, 0, sw, sh, 0xFC06080E);
-            ctx.fill(0, 0, sw, 2, 0xFF00E5FF);
-            ctx.fill(0, sh - 2, sw, sh, 0xFF00E5FF);
-            String badge = "⚡ NO RENDER AFK MODE ĐANG BẬT (Nhấn F9 để tắt) ⚡";
-            String sub = "KillAura vẫn đang tự động chém quái bình thường ở chế độ ngầm";
-            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(badge).formatted(Formatting.AQUA, Formatting.BOLD), (sw - mc.textRenderer.getWidth(badge)) / 2, sh / 2 - 10, 0x00E5FF);
-            ctx.drawTextWithShadow(mc.textRenderer, Text.literal(sub), (sw - mc.textRenderer.getWidth(sub)) / 2, sh / 2 + 4, 0x78909C);
+            int sw = ctx.getScaledWindowWidth(), sh = ctx.getScaledWindowHeight();
+            ctx.fill(0, 0, sw, sh, 0xFF05070B);
+            ctx.drawTextWithShadow(mc.textRenderer, "⚡ NO RENDER ULTRA FPS MODE (F9 để tắt) ⚡", sw / 2 - 110, sh / 2 - 6, 0x00E5FF);
         }
 
-        if (!cfg.showHud) return;
-        long ms = Math.max(1000L, System.currentTimeMillis() - sessionStartTime);
-        double perHour = totalMoney / (ms / 3600000.0);
-        String l1 = "⏱ Thời gian: " + formatDuration(ms);
-        String l2 = "💰 Farm/giờ: $" + formatMoney(perHour) + "/h (Tổng Farm: $" + formatMoney(totalMoney) + ")";
-        String l3 = "💸 Số dư Pay (" + (cfg.autoPay ? "BẬT" : "TẮT") + "): $" + formatMoney(currentBalance) + " / $" + formatMoney(cfg.payTrigger) + " -> " + (cfg.payTarget.isBlank() ? "Chưa đặt" : cfg.payTarget);
-        String l4 = "✅ Tổng đã Pay: $" + formatMoney(totalPaidMoney) + " | NoRender: " + (cfg.noRender ? "BẬT" : "TẮT");
-        String l5 = "⚔ KillAura: " + (enabled ? "BẬT" : "TẮT") + (cfg.onlyWither ? " [Wither]" : " [Mọi Quái]") + " | [F9] Setting";
-        int w = Math.max(mc.textRenderer.getWidth(l1), Math.max(mc.textRenderer.getWidth(l2), Math.max(mc.textRenderer.getWidth(l3), Math.max(mc.textRenderer.getWidth(l4), mc.textRenderer.getWidth(l5))))) + 14;
-        ctx.fill(5, 5, 5 + w, 67, 0xCC0D1017);
+        if (!cfg.showHud || hudL1.isEmpty()) return;
+        ctx.fill(5, 5, 5 + hudWidth, 67, 0xCC0D1017);
         ctx.fill(5, 5, 7, 67, 0xFF00E5FF);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l1), 11, 9, 0xE0F7FA);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l2), 11, 20, 0x69F0AE);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l3), 11, 31, 0xFFD740);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l4), 11, 42, 0xEA80FC);
-        ctx.drawTextWithShadow(mc.textRenderer, Text.literal(l5), 11, 53, enabled ? 0x00E5FF : 0xFF5252);
+        ctx.drawTextWithShadow(mc.textRenderer, hudL1, 11, 9, 0xE0F7FA);
+        ctx.drawTextWithShadow(mc.textRenderer, hudL2, 11, 20, 0x69F0AE);
+        ctx.drawTextWithShadow(mc.textRenderer, hudL3, 11, 31, 0xFFD740);
+        ctx.drawTextWithShadow(mc.textRenderer, hudL4, 11, 42, 0xEA80FC);
+        ctx.drawTextWithShadow(mc.textRenderer, hudL5, 11, 53, enabled ? 0x00E5FF : 0xFF5252);
     }
-
-    private void tick(MinecraftClient mc) {
+        private void tick(MinecraftClient mc) {
         if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
         ClientPlayerEntity p = mc.player;
         long win = mc.getWindow().getHandle(), now = System.currentTimeMillis();
 
-        updateBalanceFromScoreboard(mc);
-
-        // Tắt bóng thực thể & rung lắc khi bật No Render để giảm tải GPU tối đa
-        if (cfg.noRender) {
-            mc.options.getEntityShadows().setValue(false);
-            mc.options.getBobView().setValue(false);
-        }
+        syncNoRenderOptions(mc);
+        if (++tickCount % 10 == 0) updateHudCache(mc);
+        if (tickCount % 40 == 0) updateBalanceFromScoreboard(mc);
 
         if (nextF12Time == 0) nextF12Time = now + gauss(300000, 320000);
         else if (now >= nextF12Time) {
@@ -228,8 +236,8 @@ public class WitherAuraClient implements ClientModInitializer {
         zWasDown = zDown; xWasDown = xDown; f9WasDown = f9Down;
 
         if (tF9) { mc.setScreen(new WitherSettingsScreen(this)); return; }
-        if (tZ) { enabled = !enabled; target = null; msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Z)" : "[WitherAura] ĐÃ TẮT (Z)", enabled ? Formatting.GREEN : Formatting.RED); }
-        if (tX) { cfg.onlyWither = !cfg.onlyWither; cfg.save(); target = null; msg(p, "[WitherAura] Chế độ: " + (cfg.onlyWither ? "CHỈ WITHER" : "MỌI QUÁI"), Formatting.GOLD); }
+        if (tZ) { enabled = !enabled; target = null; updateHudCache(mc); msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Z)" : "[WitherAura] ĐÃ TẮT (Z)", enabled ? Formatting.GREEN : Formatting.RED); }
+        if (tX) { cfg.onlyWither = !cfg.onlyWither; cfg.save(); target = null; updateHudCache(mc); msg(p, "[WitherAura] Chế độ: " + (cfg.onlyWither ? "CHỈ WITHER" : "MỌI QUÁI"), Formatting.GOLD); }
 
         handleAutoPay(mc, p, now);
         if (!enabled) return;
@@ -241,14 +249,18 @@ public class WitherAuraClient implements ClientModInitializer {
         applyHumanBreathingSway(mc, p);
         if (cfg.autoSword && !isHoldingSword(p)) { autoSwitchSword(p, now); return; }
 
-        LivingEntity best = findTarget(mc, p);
-        if (best == null) { target = null; return; }
-        if (best != target) {
-            target = best; acquireTime = now; reactDelay = gauss(cfg.minReactMs, cfg.maxReactMs);
-            curRange = cfg.minRange + rng.nextDouble() * (cfg.maxRange - cfg.minRange); shiftAim(now);
+        if (target == null || !target.isAlive() || target.isRemoved() || p.squaredDistanceTo(target) > (curRange + 0.5) * (curRange + 0.5)) {
+            LivingEntity best = findTargetFast(mc, p);
+            if (best == null) { target = null; return; }
+            target = best;
+            acquireTime = now;
+            reactDelay = gauss(cfg.minReactMs, cfg.maxReactMs);
+            curRange = cfg.minRange + rng.nextDouble() * (cfg.maxRange - cfg.minRange);
+            shiftAim(now);
         }
+
         if (now >= nextShift) shiftAim(now);
-        Vec3d visPt = getVisiblePoint(mc, p, target);
+        Vec3d visPt = getVisiblePointFast(mc, p, target);
         if (visPt == null) { target = null; return; }
         if (cfg.autoSword) autoSwitchSword(p, now);
         if (isBroken(p.getMainHandStack())) return;
@@ -264,38 +276,57 @@ public class WitherAuraClient implements ClientModInitializer {
         p.swingHand(Hand.MAIN_HAND);
         if (cfg.sprintReset && p.isSprinting() && rng.nextDouble() < 0.60) { p.setSprinting(false); holdingSprint = true; sprintResume = now + gauss(45, 115); }
         nextAtk = now + gauss(cfg.minAttackJitterMs, cfg.maxAttackJitterMs);
-            }
-        private void handleAutoPay(MinecraftClient mc, ClientPlayerEntity p, long now) {
-        if (!cfg.autoPay || cfg.payTarget == null || cfg.payTarget.trim().isEmpty()) return;
-        if (now - lastPayExecTime < 8000) return;
+    }
 
+    private LivingEntity findTargetFast(MinecraftClient mc, ClientPlayerEntity p) {
+        Box box = p.getBoundingBox().expand(curRange + 0.4);
+        List<LivingEntity> list = mc.world.getEntitiesByClass(LivingEntity.class, box,
+                le -> le != p && le.isAlive() && !le.isRemoved() && (cfg.onlyWither ? le instanceof WitherSkeletonEntity : (le instanceof HostileEntity && !(le instanceof PlayerEntity))));
+        LivingEntity best = null;
+        double bestVal = Double.MAX_VALUE;
+        boolean byHealth = "HEALTH".equalsIgnoreCase(cfg.priority);
+        for (LivingEntity le : list) {
+            if (angleTo(p, le.getBoundingBox().getCenter())[0] > cfg.fov * 0.5f) continue;
+            if (getVisiblePointFast(mc, p, le) == null) continue;
+            double val = byHealth ? le.getHealth() : p.squaredDistanceTo(le);
+            if (val < bestVal) { bestVal = val; best = le; }
+        }
+        return best;
+    }
+
+    private Vec3d getVisiblePointFast(MinecraftClient mc, ClientPlayerEntity p, Entity e) {
+        Box b = e.getBoundingBox();
+        Vec3d center = b.getCenter();
+        if (p.canSee(e)) return center;
+        Vec3d eye = p.getEyePos();
+        Vec3d feet = new Vec3d(center.x, b.minY + b.getLengthY() * 0.3, center.z);
+        if (mc.world.raycast(new RaycastContext(eye, feet, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, p)).getType() == HitResult.Type.MISS) return feet;
+        return null;
+    }
+
+    private void handleAutoPay(MinecraftClient mc, ClientPlayerEntity p, long now) {
+        if (!cfg.autoPay || cfg.payTarget == null || cfg.payTarget.trim().isEmpty() || now - lastPayExecTime < 8000) return;
         if (scheduledPayTime == 0 && currentBalance >= cfg.payTrigger) {
             double minP = Math.min(cfg.payMin, cfg.payMax), maxP = Math.max(cfg.payMin, cfg.payMax);
-            double rawAmt = minP + rng.nextDouble() * (maxP - minP);
-            pendingPayAmount = Math.min(rawAmt, currentBalance);
+            pendingPayAmount = Math.min(minP + rng.nextDouble() * (maxP - minP), currentBalance);
             scheduledPayTime = now + gauss(1800, 4500);
         }
         if (scheduledPayTime > 0 && now >= scheduledPayTime && mc.currentScreen == null) {
             executePayCommand(p, pendingPayAmount);
-            lastPayExecTime = now;
-            scheduledPayTime = 0;
-            pendingPayAmount = 0.0;
+            lastPayExecTime = now; scheduledPayTime = 0; pendingPayAmount = 0.0;
             lockAtkUntil = now + gauss(350, 750);
         }
     }
 
     public void executePayCommand(ClientPlayerEntity p, double amount) {
         if (cfg.payTarget == null || cfg.payTarget.trim().isEmpty()) { msg(p, "[WitherAura] Chưa nhập tên người nhận (F9)!", Formatting.RED); return; }
-        double actualPaid;
-        String amtStr;
+        double actualPaid; String amtStr;
         if (cfg.useShortPayFormat && amount >= 1e6) {
             double m = Math.round((amount / 1e6) * 10.0) / 10.0;
             actualPaid = m * 1e6;
             amtStr = (m == (long) m) ? String.format(Locale.US, "%dM", (long) m) : String.format(Locale.US, "%.1fM", m);
         } else {
-            long rounded = Math.round(amount);
-            actualPaid = rounded;
-            amtStr = String.valueOf(rounded);
+            long rounded = Math.round(amount); actualPaid = rounded; amtStr = String.valueOf(rounded);
         }
         totalPaidMoney += actualPaid;
         currentBalance = Math.max(0.0, currentBalance - actualPaid);
@@ -328,7 +359,7 @@ public class WitherAuraClient implements ClientModInitializer {
 
     private void applyHumanBreathingSway(MinecraftClient mc, ClientPlayerEntity p) {
         swayPhase += 0.09 + rng.nextDouble() * 0.07;
-        if (rng.nextDouble() < 0.40) {
+        if (rng.nextDouble() < 0.35) {
             applyGcdRotation(mc, p, (float) (Math.sin(swayPhase) * 0.07 + rng.nextGaussian() * 0.09), (float) (Math.cos(swayPhase * 0.8) * 0.05 + rng.nextGaussian() * 0.07));
         }
     }
@@ -339,30 +370,7 @@ public class WitherAuraClient implements ClientModInitializer {
         p.setYaw(p.getYaw() + dYaw - (dYaw % gcd));
         p.setPitch(MathHelper.clamp(p.getPitch() + dPitch - (dPitch % gcd), -89.9f, 89.9f));
     }
-
-    private LivingEntity findTarget(MinecraftClient mc, ClientPlayerEntity p) {
-        double rSq = (curRange + 0.35) * (curRange + 0.35);
-        return StreamSupport.stream(mc.world.getEntities().spliterator(), false)
-                .filter(e -> e != p && e instanceof LivingEntity le && le.isAlive() && !e.isRemoved() && (cfg.onlyWither ? le instanceof WitherSkeletonEntity : (le instanceof HostileEntity && !(le instanceof PlayerEntity))))
-                .map(e -> (LivingEntity) e)
-                .filter(e -> getClosestPoint(p.getEyePos(), e.getBoundingBox()).squaredDistanceTo(p.getEyePos()) <= rSq && angleTo(p, e.getBoundingBox().getCenter())[0] <= cfg.fov * 0.5f && getVisiblePoint(mc, p, e) != null)
-                .min(Comparator.comparingDouble(e -> "HEALTH".equalsIgnoreCase(cfg.priority) ? e.getHealth() : e.squaredDistanceTo(p))).orElse(null);
-    }
-
-    private Vec3d getVisiblePoint(MinecraftClient mc, ClientPlayerEntity p, Entity e) {
-        Vec3d eye = p.getEyePos(); Box b = e.getBoundingBox(); Vec3d c = getClosestPoint(eye, b);
-        for (double f : new double[]{0.52, 0.32, 0.72, 0.18, 0.84}) {
-            Vec3d pt = new Vec3d(MathHelper.lerp(0.35, c.x, b.getCenter().x), b.minY + b.getLengthY() * f, MathHelper.lerp(0.35, c.z, b.getCenter().z));
-            if (eye.squaredDistanceTo(pt) <= (curRange + 0.3) * (curRange + 0.3) && mc.world.raycast(new RaycastContext(eye, pt, RaycastContext.ShapeType.COLLIDER, RaycastContext.FluidHandling.NONE, p)).getType() == HitResult.Type.MISS) return pt;
-        }
-        return p.canSee(e) ? b.getCenter() : null;
-    }
-
-    private Vec3d getClosestPoint(Vec3d pos, Box b) {
-        return new Vec3d(MathHelper.clamp(pos.x, b.minX, b.maxX), MathHelper.clamp(pos.y, b.minY, b.maxY), MathHelper.clamp(pos.z, b.minZ, b.maxZ));
-    }
-
-    private float[] angleTo(ClientPlayerEntity p, Vec3d pt) {
+        private float[] angleTo(ClientPlayerEntity p, Vec3d pt) {
         Vec3d d = pt.subtract(p.getEyePos());
         float tYaw = (float) (MathHelper.atan2(d.z, d.x) * (180.0 / Math.PI)) - 90.0f;
         float tPitch = (float) (-(MathHelper.atan2(d.y, Math.sqrt(d.x * d.x + d.z * d.z)) * (180.0 / Math.PI)));
@@ -436,7 +444,12 @@ public class WitherAuraClient implements ClientModInitializer {
             this.addDrawableChild(ButtonWidget.builder(txtAura(), b -> { mod.enabled = !mod.enabled; b.setMessage(txtAura()); }).dimensions(L, cy + 34, 150, 20).build());
             this.addDrawableChild(ButtonWidget.builder(txtMode(), b -> { cfg.onlyWither = !cfg.onlyWither; b.setMessage(txtMode()); }).dimensions(R, cy + 34, 150, 20).build());
             this.addDrawableChild(ButtonWidget.builder(txtHud(), b -> { cfg.showHud = !cfg.showHud; b.setMessage(txtHud()); }).dimensions(L, cy + 58, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(txtNoRender(), b -> { cfg.noRender = !cfg.noRender; cfg.save(); b.setMessage(txtNoRender()); }).dimensions(R, cy + 58, 150, 20).build());
+            this.addDrawableChild(ButtonWidget.builder(txtNoRender(), b -> {
+                cfg.noRender = !cfg.noRender;
+                cfg.save();
+                mod.syncNoRenderOptions(MinecraftClient.getInstance());
+                b.setMessage(txtNoRender());
+            }).dimensions(R, cy + 58, 150, 20).build());
             this.addDrawableChild(ButtonWidget.builder(Text.literal("💸 Test Pay Ngay").formatted(Formatting.AQUA), b -> {
                 saveInputs();
                 if (this.client != null && this.client.player != null) {
@@ -504,5 +517,4 @@ public class WitherAuraClient implements ClientModInitializer {
         }
         public void save() { try (FileWriter w = new FileWriter(FILE)) { GSON.toJson(this, w); } catch (Exception ignored) {} }
     }
-                        }
-                                                       
+        }
