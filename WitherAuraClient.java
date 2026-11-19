@@ -62,12 +62,12 @@ public class WitherAuraClient implements ClientModInitializer {
     private double savedEntityScale = 1.0, pendingPayAmount = 0.0, curRange = 2.95, swayPhase = 0.0;
     private double totalMoney = 0.0, currentBalance = 0.0, totalPaidMoney = 0.0;
     private boolean savedShadows = true, savedBob = true, savedAo = true;
-    private String hudL1 = "", hudL2 = "", hudL3 = "", hudL4 = "", hudL5 = "";
+    private String hudL1 = "", hudL2 = "", hudL3 = "", hudL4 = "", hudL5 = "", hudL6 = "";
 
     private LivingEntity target = null;
     private Vec3d aimOffset = Vec3d.ZERO;
     private long sessionStartTime = 0, acquireTime, reactDelay, nextShift, nextAtk, switchTime, lockAtkUntil, sprintResume, nextF12Time = 0;
-    private long scheduledPayTime = 0, lastPayExecTime = 0;
+    private long scheduledPayTime = 0, lastPayExecTime = 0, lastHitTime = 0, homeJitterMs = 3000;
 
     private static final Pattern MONEY_PATTERN = Pattern.compile("\\$\\s*([0-9]+(?:[.,][0-9]+)?)\\s*([kKmMbB]?)");
     private static final Pattern SB_BALANCE_PATTERN = Pattern.compile("(?:^|Money:?\\s*|Balance:?\\s*|\\s)\\$\\s*([0-9]+(?:[.,][0-9]+)?)\\s*([kKmMbB]?)(?:\\b|$)", Pattern.CASE_INSENSITIVE);
@@ -89,7 +89,10 @@ public class WitherAuraClient implements ClientModInitializer {
     }
 
     public void resetSessionStats() {
-        sessionStartTime = System.currentTimeMillis();
+        long now = System.currentTimeMillis();
+        sessionStartTime = now;
+        lastHitTime = now;
+        homeJitterMs = gauss(1000, 12000);
         totalMoney = 0.0;
         currentBalance = 0.0;
         totalPaidMoney = 0.0;
@@ -178,15 +181,26 @@ public class WitherAuraClient implements ClientModInitializer {
     }
 
     private void updateHudCache(MinecraftClient mc) {
-        long ms = Math.max(1000L, System.currentTimeMillis() - sessionStartTime);
+        long now = System.currentTimeMillis();
+        long ms = Math.max(1000L, now - sessionStartTime);
         double perHour = totalMoney / (ms / 3600000.0);
         hudL1 = "⏱ Thời gian: " + formatDuration(ms);
         hudL2 = "💰 Farm/giờ: $" + formatMoney(perHour) + "/h (Tổng: $" + formatMoney(totalMoney) + ")";
         hudL3 = "💸 Số dư Pay (" + (cfg.autoPay ? "BẬT" : "TẮT") + "): $" + formatMoney(currentBalance) + " / $" + formatMoney(cfg.payTrigger);
         hudL4 = "✅ Đã Pay: $" + formatMoney(totalPaidMoney) + " -> " + (cfg.payTarget.isBlank() ? "Chưa đặt" : cfg.payTarget);
         hudL5 = "⚔ KillAura: " + (enabled ? "BẬT" : "TẮT") + (cfg.onlyWither ? " [Wither]" : " [Mọi Quái]") + " | [F9] Menu";
+
+        long idleMs = now - lastHitTime;
+        long targetMs = Math.max(1, cfg.autoHomeMinutes) * 60_000L;
+        if (enabled && cfg.autoHome && idleMs >= 15_000L) {
+            hudL6 = "🏠 Đứng xa: " + formatDuration(idleMs) + " / " + formatDuration(targetMs) + " -> /" + cfg.homeCmd;
+        } else {
+            hudL6 = "";
+        }
+
         hudWidth = Math.max(mc.textRenderer.getWidth(hudL1), Math.max(mc.textRenderer.getWidth(hudL2),
-                Math.max(mc.textRenderer.getWidth(hudL3), Math.max(mc.textRenderer.getWidth(hudL4), mc.textRenderer.getWidth(hudL5))))) + 14;
+                Math.max(mc.textRenderer.getWidth(hudL3), Math.max(mc.textRenderer.getWidth(hudL4),
+                Math.max(mc.textRenderer.getWidth(hudL5), mc.textRenderer.getWidth(hudL6)))))) + 14;
     }
 
     private void renderHud(DrawContext ctx, RenderTickCounter tc) {
@@ -200,13 +214,15 @@ public class WitherAuraClient implements ClientModInitializer {
         }
 
         if (!cfg.showHud || hudL1.isEmpty()) return;
-        ctx.fill(5, 5, 5 + hudWidth, 67, 0xCC0D1017);
-        ctx.fill(5, 5, 7, 67, 0xFF00E5FF);
+        int h = hudL6.isEmpty() ? 67 : 78;
+        ctx.fill(5, 5, 5 + hudWidth, h, 0xCC0D1017);
+        ctx.fill(5, 5, 7, h, 0xFF00E5FF);
         ctx.drawTextWithShadow(mc.textRenderer, hudL1, 11, 9, 0xE0F7FA);
         ctx.drawTextWithShadow(mc.textRenderer, hudL2, 11, 20, 0x69F0AE);
         ctx.drawTextWithShadow(mc.textRenderer, hudL3, 11, 31, 0xFFD740);
         ctx.drawTextWithShadow(mc.textRenderer, hudL4, 11, 42, 0xEA80FC);
         ctx.drawTextWithShadow(mc.textRenderer, hudL5, 11, 53, enabled ? 0x00E5FF : 0xFF5252);
+        if (!hudL6.isEmpty()) ctx.drawTextWithShadow(mc.textRenderer, hudL6, 11, 64, 0xFFAB40);
     }
         private void tick(MinecraftClient mc) {
         if (mc.player == null || mc.world == null || mc.interactionManager == null) return;
@@ -236,7 +252,14 @@ public class WitherAuraClient implements ClientModInitializer {
         zWasDown = zDown; xWasDown = xDown; f9WasDown = f9Down;
 
         if (tF9) { mc.setScreen(new WitherSettingsScreen(this)); return; }
-        if (tZ) { enabled = !enabled; target = null; updateHudCache(mc); msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Z)" : "[WitherAura] ĐÃ TẮT (Z)", enabled ? Formatting.GREEN : Formatting.RED); }
+        if (tZ) {
+            enabled = !enabled;
+            target = null;
+            lastHitTime = now;
+            homeJitterMs = gauss(1000, 12000);
+            updateHudCache(mc);
+            msg(p, enabled ? "[WitherAura] ĐÃ BẬT (Z)" : "[WitherAura] ĐÃ TẮT (Z)", enabled ? Formatting.GREEN : Formatting.RED);
+        }
         if (tX) { cfg.onlyWither = !cfg.onlyWither; cfg.save(); target = null; updateHudCache(mc); msg(p, "[WitherAura] Chế độ: " + (cfg.onlyWither ? "CHỈ WITHER" : "MỌI QUÁI"), Formatting.GOLD); }
 
         handleAutoPay(mc, p, now);
@@ -244,6 +267,10 @@ public class WitherAuraClient implements ClientModInitializer {
         if (holdingSprint && now >= sprintResume) { holdingSprint = false; if (mc.options.forwardKey.isPressed()) p.setSprinting(true); }
         if (p.getHealth() <= cfg.minHealth || (cfg.panicPlayer && hasNearPlayer(mc, p))) { enabled = false; target = null; msg(p, "[WitherAura] Tự ngắt an toàn!", Formatting.RED); return; }
         if (mc.currentScreen != null) return;
+
+        // Kiểm tra nếu đứng xa không chém được quái quá 10 phút -> Tự động /home 1 về chỗ farm
+        handleAutoHome(p, now);
+
         if (isEatingOrHoldingFood(mc, p)) { pendingSlot = -1; return; }
 
         applyHumanBreathingSway(mc, p);
@@ -274,8 +301,27 @@ public class WitherAuraClient implements ClientModInitializer {
 
         mc.interactionManager.attackEntity(p, target);
         p.swingHand(Hand.MAIN_HAND);
+        lastHitTime = now; // Đã chém trúng -> Reset bộ đếm đứng xa về 0
+
         if (cfg.sprintReset && p.isSprinting() && rng.nextDouble() < 0.60) { p.setSprinting(false); holdingSprint = true; sprintResume = now + gauss(45, 115); }
         nextAtk = now + gauss(cfg.minAttackJitterMs, cfg.maxAttackJitterMs);
+    }
+
+    private void handleAutoHome(ClientPlayerEntity p, long now) {
+        if (!cfg.autoHome) return;
+        long timeoutMs = Math.max(1, cfg.autoHomeMinutes) * 60_000L + homeJitterMs;
+        if (now - lastHitTime >= timeoutMs) {
+            String cmd = cfg.homeCmd == null ? "home 1" : cfg.homeCmd.trim();
+            if (cmd.startsWith("/")) cmd = cmd.substring(1).trim();
+            if (!cmd.isEmpty()) {
+                p.networkHandler.sendChatCommand(cmd);
+                msg(p, "[WitherAura] Quá " + cfg.autoHomeMinutes + "p không chém được -> /" + cmd, Formatting.AQUA);
+            }
+            lastHitTime = now;
+            homeJitterMs = gauss(1000, 12000);
+            lockAtkUntil = now + gauss(600, 1400);
+            target = null;
+        }
     }
 
     private LivingEntity findTargetFast(MinecraftClient mc, ClientPlayerEntity p) {
@@ -369,7 +415,7 @@ public class WitherAuraClient implements ClientModInitializer {
         float gcd = (float) (f * f * f * 1.2);
         p.setYaw(p.getYaw() + dYaw - (dYaw % gcd));
         p.setPitch(MathHelper.clamp(p.getPitch() + dPitch - (dPitch % gcd), -89.9f, 89.9f));
-    }
+                             }
         private float[] angleTo(ClientPlayerEntity p, Vec3d pt) {
         Vec3d d = pt.subtract(p.getEyePos());
         float tYaw = (float) (MathHelper.atan2(d.z, d.x) * (180.0 / Math.PI)) - 90.0f;
@@ -428,41 +474,43 @@ public class WitherAuraClient implements ClientModInitializer {
 
     public static class WitherSettingsScreen extends Screen {
         private final WitherAuraClient mod;
-        private TextFieldWidget targetF, trigF, minF, maxF;
+        private TextFieldWidget targetF, trigF, minF, maxF, homeCmdF, homeMinF;
         protected WitherSettingsScreen(WitherAuraClient mod) { super(Text.literal("Settings")); this.mod = mod; }
 
         @Override
         protected void init() {
             int cx = this.width / 2, cy = this.height / 2, L = cx - 155, R = cx + 5;
-            targetF = addField(L, cy - 58, cfg.payTarget);
-            trigF = addField(R, cy - 58, formatMoney(cfg.payTrigger));
-            minF = addField(L, cy - 18, formatMoney(cfg.payMin));
-            maxF = addField(R, cy - 18, formatMoney(cfg.payMax));
+            targetF = addField(L, cy - 66, cfg.payTarget);
+            trigF = addField(R, cy - 66, formatMoney(cfg.payTrigger));
+            minF = addField(L, cy - 34, formatMoney(cfg.payMin));
+            maxF = addField(R, cy - 34, formatMoney(cfg.payMax));
+            homeCmdF = addField(L, cy - 2, cfg.homeCmd);
+            homeMinF = addField(R, cy - 2, String.valueOf(cfg.autoHomeMinutes));
 
-            this.addDrawableChild(ButtonWidget.builder(txtPay(), b -> { cfg.autoPay = !cfg.autoPay; b.setMessage(txtPay()); }).dimensions(L, cy + 10, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(txtFmt(), b -> { cfg.useShortPayFormat = !cfg.useShortPayFormat; b.setMessage(txtFmt()); }).dimensions(R, cy + 10, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(txtAura(), b -> { mod.enabled = !mod.enabled; b.setMessage(txtAura()); }).dimensions(L, cy + 34, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(txtMode(), b -> { cfg.onlyWither = !cfg.onlyWither; b.setMessage(txtMode()); }).dimensions(R, cy + 34, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(txtHud(), b -> { cfg.showHud = !cfg.showHud; b.setMessage(txtHud()); }).dimensions(L, cy + 58, 150, 20).build());
+            this.addDrawableChild(ButtonWidget.builder(txtPay(), b -> { cfg.autoPay = !cfg.autoPay; b.setMessage(txtPay()); }).dimensions(L, cy + 20, 150, 18).build());
+            this.addDrawableChild(ButtonWidget.builder(txtFmt(), b -> { cfg.useShortPayFormat = !cfg.useShortPayFormat; b.setMessage(txtFmt()); }).dimensions(R, cy + 20, 150, 18).build());
+            this.addDrawableChild(ButtonWidget.builder(txtAura(), b -> { mod.enabled = !mod.enabled; mod.lastHitTime = System.currentTimeMillis(); b.setMessage(txtAura()); }).dimensions(L, cy + 41, 150, 18).build());
+            this.addDrawableChild(ButtonWidget.builder(txtMode(), b -> { cfg.onlyWither = !cfg.onlyWither; b.setMessage(txtMode()); }).dimensions(R, cy + 41, 150, 18).build());
+            this.addDrawableChild(ButtonWidget.builder(txtHud(), b -> { cfg.showHud = !cfg.showHud; b.setMessage(txtHud()); }).dimensions(L, cy + 62, 150, 18).build());
             this.addDrawableChild(ButtonWidget.builder(txtNoRender(), b -> {
-                cfg.noRender = !cfg.noRender;
-                cfg.save();
+                cfg.noRender = !cfg.noRender; cfg.save();
                 mod.syncNoRenderOptions(MinecraftClient.getInstance());
                 b.setMessage(txtNoRender());
-            }).dimensions(R, cy + 58, 150, 20).build());
+            }).dimensions(R, cy + 62, 150, 18).build());
+            this.addDrawableChild(ButtonWidget.builder(txtHome(), b -> { cfg.autoHome = !cfg.autoHome; b.setMessage(txtHome()); }).dimensions(L, cy + 83, 150, 18).build());
+            this.addDrawableChild(ButtonWidget.builder(Text.literal("🔄 Reset Thống Kê").formatted(Formatting.YELLOW), b -> mod.resetSessionStats()).dimensions(R, cy + 83, 150, 18).build());
             this.addDrawableChild(ButtonWidget.builder(Text.literal("💸 Test Pay Ngay").formatted(Formatting.AQUA), b -> {
                 saveInputs();
                 if (this.client != null && this.client.player != null) {
                     double mn = Math.min(cfg.payMin, cfg.payMax), mx = Math.max(cfg.payMin, cfg.payMax);
                     mod.executePayCommand(this.client.player, mn + mod.rng.nextDouble() * (mx - mn));
                 }
-            }).dimensions(L, cy + 82, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(Text.literal("🔄 Reset Toàn Bộ Thống Kê").formatted(Formatting.YELLOW), b -> mod.resetSessionStats()).dimensions(R, cy + 82, 150, 20).build());
-            this.addDrawableChild(ButtonWidget.builder(Text.literal("✔ LƯU & ĐÓNG (F9 / ESC)").formatted(Formatting.GREEN, Formatting.BOLD), b -> this.close()).dimensions(L, cy + 106, 310, 22).build());
+            }).dimensions(L, cy + 104, 150, 20).build());
+            this.addDrawableChild(ButtonWidget.builder(Text.literal("✔ LƯU & ĐÓNG (ESC)").formatted(Formatting.GREEN, Formatting.BOLD), b -> this.close()).dimensions(R, cy + 104, 150, 20).build());
         }
 
         private TextFieldWidget addField(int x, int y, String val) {
-            TextFieldWidget f = new TextFieldWidget(this.textRenderer, x, y, 150, 18, Text.empty());
+            TextFieldWidget f = new TextFieldWidget(this.textRenderer, x, y, 150, 16, Text.empty());
             f.setMaxLength(32); f.setText(val); return this.addDrawableChild(f);
         }
         private Text txtPay() { return Text.literal("Auto Pay: " + (cfg.autoPay ? "BẬT ✔" : "TẮT ✖")).formatted(cfg.autoPay ? Formatting.GREEN : Formatting.RED); }
@@ -471,45 +519,52 @@ public class WitherAuraClient implements ClientModInitializer {
         private Text txtMode() { return Text.literal("Mục tiêu: " + (cfg.onlyWither ? "Chỉ Wither" : "Mọi Quái")).formatted(Formatting.GOLD); }
         private Text txtHud() { return Text.literal("Bảng HUD: " + (cfg.showHud ? "HIỆN ✔" : "ẨN ✖")).formatted(cfg.showHud ? Formatting.GREEN : Formatting.GRAY); }
         private Text txtNoRender() { return Text.literal("No Render: " + (cfg.noRender ? "BẬT ✔" : "TẮT ✖")).formatted(cfg.noRender ? Formatting.LIGHT_PURPLE : Formatting.GRAY); }
+        private Text txtHome() { return Text.literal("Auto Home: " + (cfg.autoHome ? "BẬT ✔" : "TẮT ✖")).formatted(cfg.autoHome ? Formatting.GREEN : Formatting.RED); }
 
         private void saveInputs() {
             if (targetF != null) cfg.payTarget = targetF.getText().trim();
             if (trigF != null) cfg.payTrigger = parseMoneyInput(trigF.getText(), cfg.payTrigger);
             if (minF != null) cfg.payMin = parseMoneyInput(minF.getText(), cfg.payMin);
             if (maxF != null) cfg.payMax = parseMoneyInput(maxF.getText(), cfg.payMax);
+            if (homeCmdF != null && !homeCmdF.getText().isBlank()) cfg.homeCmd = homeCmdF.getText().trim().replaceFirst("^/", "");
+            if (homeMinF != null) {
+                try { cfg.autoHomeMinutes = Math.max(1, Integer.parseInt(homeMinF.getText().trim())); } catch (Exception ignored) {}
+            }
             cfg.save();
         }
         @Override public void close() { saveInputs(); super.close(); }
         @Override public void renderBackground(DrawContext ctx, int mx, int my, float d) {
             ctx.fill(0, 0, this.width, this.height, 0xA805070B);
-            int cx = this.width / 2, cy = this.height / 2, x1 = cx - 170, y1 = cy - 120, x2 = cx + 170, y2 = cy + 136;
+            int cx = this.width / 2, cy = this.height / 2, x1 = cx - 170, y1 = cy - 122, x2 = cx + 170, y2 = cy + 132;
             ctx.fill(x1 - 2, y1 - 2, x2 + 2, y2 + 2, 0xFF00E5FF);
             ctx.fill(x1, y1, x2, y2, 0xF210141F);
-            ctx.fill(x1, y1, x2, y1 + 28, 0xFF182032);
-            ctx.fill(x1, y1 + 28, x2, y1 + 29, 0xFF00E5FF);
+            ctx.fill(x1, y1, x2, y1 + 26, 0xFF182032);
+            ctx.fill(x1, y1 + 26, x2, y1 + 27, 0xFF00E5FF);
         }
         @Override public void render(DrawContext ctx, int mx, int my, float d) {
             super.render(ctx, mx, my, d);
             int cx = this.width / 2, cy = this.height / 2, L = cx - 155, R = cx + 5;
             String title = "⚡ WITHER AURA & AUTO PAY PANEL ⚡";
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal(title).formatted(Formatting.AQUA, Formatting.BOLD), cx - this.textRenderer.getWidth(title) / 2, cy - 110, 0x00E5FF);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal(title).formatted(Formatting.AQUA, Formatting.BOLD), cx - this.textRenderer.getWidth(title) / 2, cy - 113, 0x00E5FF);
             String st = "Số dư: $" + formatMoney(mod.currentBalance) + "/$" + formatMoney(cfg.payTrigger) + " | Đã Pay: $" + formatMoney(mod.totalPaidMoney);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal(st), cx - this.textRenderer.getWidth(st) / 2, cy - 86, 0x69F0AE);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal("👤 Tên người nhận (/pay):"), L, cy - 70, 0xB0BEC5);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal("🎯 Mốc Số Dư kích hoạt (VD: 35M):"), R, cy - 70, 0xB0BEC5);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬇ Pay Tối Thiểu (VD: 30M):"), L, cy - 30, 0xB0BEC5);
-            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬆ Pay Tối Đa (VD: 35M):"), R, cy - 30, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal(st), cx - this.textRenderer.getWidth(st) / 2, cy - 90, 0x69F0AE);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("👤 Tên người nhận (/pay):"), L, cy - 77, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("🎯 Mốc Số Dư (VD: 35M):"), R, cy - 77, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬇ Pay Tối Thiểu (VD: 30M):"), L, cy - 45, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⬆ Pay Tối Đa (VD: 35M):"), R, cy - 45, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("🏠 Lệnh về chỗ farm:"), L, cy - 13, 0xB0BEC5);
+            ctx.drawTextWithShadow(this.textRenderer, Text.literal("⏳ Tự /home sau (phút):"), R, cy - 13, 0xB0BEC5);
         }
     }
 
     public static class ModConfig {
         private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-        private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "wither_aura_v9.json");
-        public boolean onlyWither = true, autoSword = true, sprintReset = true, panicPlayer = false, silentMode = false, showHud = true, autoPay = true, useShortPayFormat = true, noRender = false;
-        public String payTarget = "", priority = "DISTANCE";
+        private static final File FILE = new File(FabricLoader.getInstance().getConfigDir().toFile(), "wither_aura_v10.json");
+        public boolean onlyWither = true, autoSword = true, sprintReset = true, panicPlayer = false, silentMode = false, showHud = true, autoPay = true, useShortPayFormat = true, noRender = false, autoHome = true;
+        public String payTarget = "", priority = "DISTANCE", homeCmd = "home 1";
         public double payTrigger = 35e6, payMin = 30e6, payMax = 35e6, minRange = 2.85, maxRange = 3.00, aimOffset = 0.15, panicRadius = 15.0;
         public float fov = 160.0f, minYaw = 14.0f, maxYaw = 30.0f, minPitch = 10.0f, maxPitch = 22.0f, minHealth = 6.0f;
-        public int minAttackJitterMs = 15, maxAttackJitterMs = 65, minReactMs = 30, maxReactMs = 85, minDurability = 12;
+        public int minAttackJitterMs = 15, maxAttackJitterMs = 65, minReactMs = 30, maxReactMs = 85, minDurability = 12, autoHomeMinutes = 10;
 
         public static ModConfig load() {
             if (FILE.exists()) try (FileReader r = new FileReader(FILE)) { return GSON.fromJson(r, ModConfig.class); } catch (Exception ignored) {}
@@ -517,4 +572,5 @@ public class WitherAuraClient implements ClientModInitializer {
         }
         public void save() { try (FileWriter w = new FileWriter(FILE)) { GSON.toJson(this, w); } catch (Exception ignored) {} }
     }
-        }
+    }
+                                         
